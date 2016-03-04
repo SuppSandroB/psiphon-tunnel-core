@@ -27,10 +27,11 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	regen "github.com/Psiphon-Inc/goregen"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/transferstats"
 	"golang.org/x/crypto/ssh"
 )
@@ -58,37 +59,26 @@ type TunnelOwner interface {
 	SignalTunnelFailure(tunnel *Tunnel)
 }
 
-const (
-	TUNNEL_PROTOCOL_SSH            = "SSH"
-	TUNNEL_PROTOCOL_OBFUSCATED_SSH = "OSSH"
-	TUNNEL_PROTOCOL_UNFRONTED_MEEK = "UNFRONTED-MEEK-OSSH"
-	TUNNEL_PROTOCOL_FRONTED_MEEK   = "FRONTED-MEEK-OSSH"
-)
-
-// This is a list of supported tunnel protocols, in default preference order
-var SupportedTunnelProtocols = []string{
-	TUNNEL_PROTOCOL_FRONTED_MEEK,
-	TUNNEL_PROTOCOL_UNFRONTED_MEEK,
-	TUNNEL_PROTOCOL_OBFUSCATED_SSH,
-	TUNNEL_PROTOCOL_SSH,
-}
-
 // Tunnel is a connection to a Psiphon server. An established
 // tunnel includes a network connection to the specified server
 // and an SSH session built on top of that transport.
 type Tunnel struct {
 	mutex                    *sync.Mutex
+	config                   *Config
+	untunneledDialConfig     *DialConfig
+	isDiscarded              bool
 	isClosed                 bool
 	serverEntry              *ServerEntry
-	session                  *Session
+	serverContext            *ServerContext
 	protocol                 string
-	conn                     Conn
-	closedSignal             chan struct{}
+	conn                     net.Conn
 	sshClient                *ssh.Client
 	operateWaitGroup         *sync.WaitGroup
 	shutdownOperateBroadcast chan struct{}
-	portForwardFailures      chan int
-	portForwardFailureTotal  int
+	signalPortForwardFailure chan struct{}
+	totalPortForwardFailures int
+	startTime                time.Time
+	frontedMeekStats         *FrontedMeekStats
 }
 
 // EstablishTunnel first makes a network transport connection to the
@@ -99,10 +89,11 @@ type Tunnel struct {
 // plain SSH over TCP, obfuscated SSH over TCP, or obfuscated SSH over
 // HTTP (meek protocol).
 // When requiredProtocol is not blank, that protocol is used. Otherwise,
-// the first protocol in SupportedTunnelProtocols that's also in the
-// server capabilities is used.
+// the a random supported protocol is used.
+// untunneledDialConfig is used for untunneled final status requests.
 func EstablishTunnel(
 	config *Config,
+	untunneledDialConfig *DialConfig,
 	sessionId string,
 	pendingConns *Conns,
 	serverEntry *ServerEntry,
@@ -114,7 +105,7 @@ func EstablishTunnel(
 	}
 
 	// Build transport layers and establish SSH connection
-	conn, closedSignal, sshClient, err := dialSsh(
+	conn, sshClient, frontedMeekStats, err := dialSsh(
 		config, pendingConns, serverEntry, selectedProtocol, sessionId)
 	if err != nil {
 		return nil, ContextError(err)
@@ -123,6 +114,7 @@ func EstablishTunnel(
 	// Cleanup on error
 	defer func() {
 		if err != nil {
+			sshClient.Close()
 			conn.Close()
 		}
 	}()
@@ -130,51 +122,59 @@ func EstablishTunnel(
 	// The tunnel is now connected
 	tunnel = &Tunnel{
 		mutex:                    new(sync.Mutex),
+		config:                   config,
+		untunneledDialConfig:     untunneledDialConfig,
 		isClosed:                 false,
 		serverEntry:              serverEntry,
 		protocol:                 selectedProtocol,
 		conn:                     conn,
-		closedSignal:             closedSignal,
 		sshClient:                sshClient,
 		operateWaitGroup:         new(sync.WaitGroup),
 		shutdownOperateBroadcast: make(chan struct{}),
-		// portForwardFailures buffer size is large enough to receive the thresold number
-		// of failure reports without blocking. Senders can drop failures without blocking.
-		portForwardFailures: make(chan int, config.PortForwardFailureThreshold)}
+		// A buffer allows at least one signal to be sent even when the receiver is
+		// not listening. Senders should not block.
+		signalPortForwardFailure: make(chan struct{}, 1),
+		frontedMeekStats:         frontedMeekStats,
+	}
 
-	// Create a new Psiphon API session for this tunnel. This includes performing
-	// a handshake request. If the handshake fails, this establishment fails.
-	//
-	// TODO: as long as the servers are not enforcing that a client perform a handshake,
-	// proceed with this tunnel as long as at least one previous handhake succeeded?
-	//
+	// Create a new Psiphon API server context for this tunnel. This includes
+	// performing a handshake request. If the handshake fails, this establishment
+	// fails.
 	if !config.DisableApi {
-		NoticeInfo("starting session for %s", tunnel.serverEntry.IpAddress)
-		tunnel.session, err = NewSession(config, tunnel, sessionId)
+		NoticeInfo("starting server context for %s", tunnel.serverEntry.IpAddress)
+		tunnel.serverContext, err = NewServerContext(tunnel, sessionId)
 		if err != nil {
-			return nil, ContextError(fmt.Errorf("error starting session for %s: %s", tunnel.serverEntry.IpAddress, err))
+			return nil, ContextError(
+				fmt.Errorf("error starting server context for %s: %s",
+					tunnel.serverEntry.IpAddress, err))
 		}
 	}
+
+	tunnel.startTime = time.Now()
 
 	// Now that network operations are complete, cancel interruptibility
 	pendingConns.Remove(conn)
 
-	// Promote this successful tunnel to first rank so it's one
-	// of the first candidates next time establish runs.
-	PromoteServerEntry(tunnel.serverEntry.IpAddress)
-
 	// Spawn the operateTunnel goroutine, which monitors the tunnel and handles periodic stats updates.
 	tunnel.operateWaitGroup.Add(1)
-	go tunnel.operateTunnel(config, tunnelOwner)
+	go tunnel.operateTunnel(tunnelOwner)
 
 	return tunnel, nil
 }
 
 // Close stops operating the tunnel and closes the underlying connection.
 // Supports multiple and/or concurrent calls to Close().
-func (tunnel *Tunnel) Close() {
+// When isDicarded is set, operateTunnel will not attempt to send final
+// status requests.
+func (tunnel *Tunnel) Close(isDiscarded bool) {
+
 	tunnel.mutex.Lock()
-	if !tunnel.isClosed {
+	tunnel.isDiscarded = isDiscarded
+	isClosed := tunnel.isClosed
+	tunnel.isClosed = true
+	tunnel.mutex.Unlock()
+
+	if !isClosed {
 		// Signal operateTunnel to stop before closing the tunnel -- this
 		// allows a final status request to be made in the case of an orderly
 		// shutdown.
@@ -187,11 +187,17 @@ func (tunnel *Tunnel) Close() {
 		close(tunnel.shutdownOperateBroadcast)
 		tunnel.operateWaitGroup.Wait()
 		timer.Stop()
+		tunnel.sshClient.Close()
 		// tunnel.conn.Close() may get called twice, which is allowed.
 		tunnel.conn.Close()
 	}
-	tunnel.isClosed = true
-	tunnel.mutex.Unlock()
+}
+
+// IsDiscarded returns the tunnel's discarded flag.
+func (tunnel *Tunnel) IsDiscarded() bool {
+	tunnel.mutex.Lock()
+	defer tunnel.mutex.Unlock()
+	return tunnel.isDiscarded
 }
 
 // Dial establishes a port forward connection through the tunnel
@@ -202,30 +208,47 @@ func (tunnel *Tunnel) Dial(
 	tunnel.mutex.Lock()
 	isClosed := tunnel.isClosed
 	tunnel.mutex.Unlock()
+
 	if isClosed {
 		return nil, errors.New("tunnel is closed")
 	}
 
-	sshPortForwardConn, err := tunnel.sshClient.Dial("tcp", remoteAddr)
-	if err != nil {
+	type tunnelDialResult struct {
+		sshPortForwardConn net.Conn
+		err                error
+	}
+	resultChannel := make(chan *tunnelDialResult, 2)
+	time.AfterFunc(TUNNEL_PORT_FORWARD_DIAL_TIMEOUT, func() {
+		resultChannel <- &tunnelDialResult{nil, errors.New("tunnel dial timeout")}
+	})
+	go func() {
+		sshPortForwardConn, err := tunnel.sshClient.Dial("tcp", remoteAddr)
+		resultChannel <- &tunnelDialResult{sshPortForwardConn, err}
+	}()
+	result := <-resultChannel
+
+	if result.err != nil {
 		// TODO: conditional on type of error or error message?
 		select {
-		case tunnel.portForwardFailures <- 1:
+		case tunnel.signalPortForwardFailure <- *new(struct{}):
 		default:
 		}
-		return nil, ContextError(err)
+		return nil, ContextError(result.err)
 	}
 
 	conn = &TunneledConn{
-		Conn:           sshPortForwardConn,
+		Conn:           result.sshPortForwardConn,
 		tunnel:         tunnel,
 		downstreamConn: downstreamConn}
 
-	// Tunnel does not have a session when DisableApi is set
-	if tunnel.session != nil {
-		conn = transferstats.NewConn(
-			conn, tunnel.session.StatsServerID(), tunnel.session.StatsRegexps())
+	// Tunnel does not have a serverContext when DisableApi is set. We still use
+	// transferstats.Conn to count bytes transferred for monitoring tunnel
+	// quality.
+	var regexps *transferstats.Regexps
+	if tunnel.serverContext != nil {
+		regexps = tunnel.serverContext.StatsRegexps()
 	}
+	conn = transferstats.NewConn(conn, tunnel.serverEntry.IpAddress, regexps)
 
 	return conn, nil
 }
@@ -234,7 +257,7 @@ func (tunnel *Tunnel) Dial(
 // This will terminate the tunnel.
 func (tunnel *Tunnel) SignalComponentFailure() {
 	NoticeAlert("tunnel received component failure signal")
-	tunnel.Close()
+	tunnel.Close(false)
 }
 
 // TunneledConn implements net.Conn and wraps a port foward connection.
@@ -251,11 +274,11 @@ type TunneledConn struct {
 func (conn *TunneledConn) Read(buffer []byte) (n int, err error) {
 	n, err = conn.Conn.Read(buffer)
 	if err != nil && err != io.EOF {
-		// Report 1 new failure. Won't block; assumes the receiver
+		// Report new failure. Won't block; assumes the receiver
 		// has a sufficient buffer for the threshold number of reports.
 		// TODO: conditional on type of error or error message?
 		select {
-		case conn.tunnel.portForwardFailures <- 1:
+		case conn.tunnel.signalPortForwardFailure <- *new(struct{}):
 		default:
 		}
 	}
@@ -267,7 +290,7 @@ func (conn *TunneledConn) Write(buffer []byte) (n int, err error) {
 	if err != nil && err != io.EOF {
 		// Same as TunneledConn.Read()
 		select {
-		case conn.tunnel.portForwardFailures <- 1:
+		case conn.tunnel.signalPortForwardFailure <- *new(struct{}):
 		default:
 		}
 	}
@@ -276,10 +299,7 @@ func (conn *TunneledConn) Write(buffer []byte) (n int, err error) {
 
 func (conn *TunneledConn) Close() error {
 	if conn.downstreamConn != nil {
-		err := conn.downstreamConn.Close()
-		if err != nil {
-			NoticeAlert("downstreamConn.Close() error: %s", ContextError(err))
-		}
+		conn.downstreamConn.Close()
 	}
 	return conn.Conn.Close()
 }
@@ -289,8 +309,7 @@ func selectProtocol(config *Config, serverEntry *ServerEntry) (selectedProtocol 
 	// TODO: properly handle protocols (e.g. FRONTED-MEEK-OSSH) vs. capabilities (e.g., {FRONTED-MEEK, OSSH})
 	// for now, the code is simply assuming that MEEK capabilities imply OSSH capability.
 	if config.TunnelProtocol != "" {
-		requiredCapability := strings.TrimSuffix(config.TunnelProtocol, "-OSSH")
-		if !Contains(serverEntry.Capabilities, requiredCapability) {
+		if !serverEntry.SupportsProtocol(config.TunnelProtocol) {
 			return "", ContextError(fmt.Errorf("server does not have required capability"))
 		}
 		selectedProtocol = config.TunnelProtocol
@@ -298,26 +317,10 @@ func selectProtocol(config *Config, serverEntry *ServerEntry) (selectedProtocol 
 		// Pick at random from the supported protocols. This ensures that we'll eventually
 		// try all possible protocols. Depending on network configuration, it may be the
 		// case that some protocol is only available through multi-capability servers,
-		// and a simplr ranked preference of protocols could lead to that protocol never
+		// and a simpler ranked preference of protocols could lead to that protocol never
 		// being selected.
 
-		// TODO: this is a good spot to apply protocol selection weightings. This would be
-		// to defend against an attack where the adversary, for example, classifies OSSH as
-		// an "unidentified" protocol; allows it to connect; but then kills the underlying
-		// TCP connection after a short time. Since OSSH has less latency than other protocols
-		// that may bypass an "unidentified" filter, other protocols which would be otherwise
-		// classified and not killed might never be selected for use.
-		// So one proposed defense is to add negative selection weights to the protocol
-		// associated with failed tunnels (controller.failedTunnels) with short session
-		// durations.
-
-		candidateProtocols := make([]string, 0)
-		for _, protocol := range SupportedTunnelProtocols {
-			requiredCapability := strings.TrimSuffix(protocol, "-OSSH")
-			if Contains(serverEntry.Capabilities, requiredCapability) {
-				candidateProtocols = append(candidateProtocols, protocol)
-			}
-		}
+		candidateProtocols := serverEntry.GetSupportedProtocols()
 		if len(candidateProtocols) == 0 {
 			return "", ContextError(fmt.Errorf("server does not have any supported capabilities"))
 		}
@@ -331,27 +334,47 @@ func selectProtocol(config *Config, serverEntry *ServerEntry) (selectedProtocol 
 	return selectedProtocol, nil
 }
 
-// dialSsh is a helper that builds the transport layers and establishes the SSH connection
+// dialSsh is a helper that builds the transport layers and establishes the SSH connection.
+// When  FRONTED-MEEK-OSSH is selected, additional FrontedMeekStats are recorded and returned.
 func dialSsh(
 	config *Config,
 	pendingConns *Conns,
 	serverEntry *ServerEntry,
 	selectedProtocol,
-	sessionId string) (conn Conn, closedSignal chan struct{}, sshClient *ssh.Client, err error) {
+	sessionId string) (
+	conn net.Conn, sshClient *ssh.Client, frontedMeekStats *FrontedMeekStats, err error) {
 
 	// The meek protocols tunnel obfuscated SSH. Obfuscated SSH is layered on top of SSH.
 	// So depending on which protocol is used, multiple layers are initialized.
 	port := 0
 	useMeek := false
+	useMeekHTTPS := false
+	useMeekSNI := false
 	useFronting := false
 	useObfuscatedSsh := false
 	switch selectedProtocol {
 	case TUNNEL_PROTOCOL_FRONTED_MEEK:
 		useMeek = true
+		useMeekHTTPS = true
+		useMeekSNI = !serverEntry.MeekFrontingDisableSNI
+		useFronting = true
+		useObfuscatedSsh = true
+	case TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP:
+		useMeek = true
+		useMeekHTTPS = false
+		useMeekSNI = false
 		useFronting = true
 		useObfuscatedSsh = true
 	case TUNNEL_PROTOCOL_UNFRONTED_MEEK:
 		useMeek = true
+		useMeekHTTPS = false
+		useMeekSNI = false
+		useObfuscatedSsh = true
+		port = serverEntry.SshObfuscatedPort
+	case TUNNEL_PROTOCOL_UNFRONTED_MEEK_HTTPS:
+		useMeek = true
+		useMeekHTTPS = true
+		useMeekSNI = false
 		useObfuscatedSsh = true
 		port = serverEntry.SshObfuscatedPort
 	case TUNNEL_PROTOCOL_OBFUSCATED_SSH:
@@ -362,38 +385,76 @@ func dialSsh(
 	}
 
 	frontingAddress := ""
+	frontingHost := ""
 	if useFronting {
+		if len(serverEntry.MeekFrontingAddressesRegex) > 0 {
 
-		// Randomly select, for this connection attempt, one front address for
-		// fronting-capable servers.
+			// Generate a front address based on the regex.
 
-		if len(serverEntry.MeekFrontingAddresses) == 0 {
-			return nil, nil, nil, ContextError(errors.New("MeekFrontingAddresses is empty"))
+			frontingAddress, err = regen.Generate(serverEntry.MeekFrontingAddressesRegex)
+			if err != nil {
+				return nil, nil, nil, ContextError(err)
+			}
+		} else {
+
+			// Randomly select, for this connection attempt, one front address for
+			// fronting-capable servers.
+
+			if len(serverEntry.MeekFrontingAddresses) == 0 {
+				return nil, nil, nil, ContextError(errors.New("MeekFrontingAddresses is empty"))
+			}
+			index, err := MakeSecureRandomInt(len(serverEntry.MeekFrontingAddresses))
+			if err != nil {
+				return nil, nil, nil, ContextError(err)
+			}
+			frontingAddress = serverEntry.MeekFrontingAddresses[index]
 		}
-		index, err := MakeSecureRandomInt(len(serverEntry.MeekFrontingAddresses))
-		if err != nil {
-			return nil, nil, nil, ContextError(err)
+
+		if len(serverEntry.MeekFrontingHosts) > 0 {
+			index, err := MakeSecureRandomInt(len(serverEntry.MeekFrontingHosts))
+			if err != nil {
+				return nil, nil, nil, ContextError(err)
+			}
+			frontingHost = serverEntry.MeekFrontingHosts[index]
+		} else {
+			// Backwards compatibility case
+			frontingHost = serverEntry.MeekFrontingHost
 		}
-		frontingAddress = serverEntry.MeekFrontingAddresses[index]
 	}
+
 	NoticeConnectingServer(
 		serverEntry.IpAddress,
 		serverEntry.Region,
 		selectedProtocol,
 		frontingAddress)
 
+	// Use an asynchronous callback to record the resolved IP address when
+	// dialing a domain name. Note that DialMeek doesn't immediately
+	// establish any HTTPS connections, so the resolved IP address won't be
+	// reported until during/after ssh session establishment (the ssh traffic
+	// is meek payload). So don't Load() the IP address value until after that
+	// has completed to ensure a result.
+	var resolvedIPAddress atomic.Value
+	resolvedIPAddress.Store("")
+	setResolvedIPAddress := func(IPAddress string) {
+		resolvedIPAddress.Store(IPAddress)
+	}
+
 	// Create the base transport: meek or direct connection
 	dialConfig := &DialConfig{
-		UpstreamHttpProxyAddress: config.UpstreamHttpProxyAddress,
-		ConnectTimeout:           TUNNEL_CONNECT_TIMEOUT,
-		ReadTimeout:              TUNNEL_READ_TIMEOUT,
-		WriteTimeout:             TUNNEL_WRITE_TIMEOUT,
-		PendingConns:             pendingConns,
-		DeviceBinder:             config.DeviceBinder,
-		DnsServerGetter:          config.DnsServerGetter,
+		UpstreamProxyUrl:              config.UpstreamProxyUrl,
+		ConnectTimeout:                TUNNEL_CONNECT_TIMEOUT,
+		PendingConns:                  pendingConns,
+		DeviceBinder:                  config.DeviceBinder,
+		DnsServerGetter:               config.DnsServerGetter,
+		UseIndistinguishableTLS:       config.UseIndistinguishableTLS,
+		TrustedCACertificatesFilename: config.TrustedCACertificatesFilename,
+		DeviceRegion:                  config.DeviceRegion,
+		ResolvedIPCallback:            setResolvedIPAddress,
 	}
 	if useMeek {
-		conn, err = DialMeek(serverEntry, sessionId, frontingAddress, dialConfig)
+		conn, err = DialMeek(
+			serverEntry, sessionId, useMeekHTTPS, useMeekSNI, frontingAddress, frontingHost, dialConfig)
 		if err != nil {
 			return nil, nil, nil, ContextError(err)
 		}
@@ -411,20 +472,6 @@ func dialSsh(
 			cleanupConn.Close()
 		}
 	}()
-
-	// Create signal which is triggered when the underlying network connection is closed,
-	// this is used in operateTunnel to detect an unexpected disconnect. SetClosedSignal
-	// is called here, well before operateTunnel, so that we don't need to handle the
-	// "already closed" with a tunnelOwner.SignalTunnelFailure() in operateTunnel (this
-	// was previously the order of events, which caused the establish process to sometimes
-	// run briefly when not needed).
-	closedSignal = make(chan struct{}, 1)
-	if !conn.SetClosedSignal(closedSignal) {
-		// Conn is already closed. This is not unexpected -- for example,
-		// when establish is interrupted.
-		// TODO: make this not log an error when called from establishTunnelWorker?
-		return nil, nil, nil, ContextError(errors.New("conn already closed"))
-	}
 
 	// Add obfuscated SSH layer
 	var sshConn net.Conn
@@ -502,116 +549,350 @@ func dialSsh(
 		return nil, nil, nil, ContextError(result.err)
 	}
 
-	return conn, closedSignal, result.sshClient, nil
+	if selectedProtocol == TUNNEL_PROTOCOL_FRONTED_MEEK ||
+		selectedProtocol == TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP {
+
+		frontedMeekStats = &FrontedMeekStats{
+			frontingAddress:   frontingAddress,
+			resolvedIPAddress: resolvedIPAddress.Load().(string),
+			enabledSNI:        useMeekSNI,
+			frontingHost:      frontingHost,
+		}
+
+		NoticeFrontedMeekStats(serverEntry.IpAddress, frontedMeekStats)
+	}
+
+	return conn, result.sshClient, frontedMeekStats, nil
 }
 
-// operateTunnel periodically sends status requests (traffic stats updates updates)
-// to the Psiphon API; and monitors the tunnel for failures:
+// operateTunnel monitors the health of the tunnel and performs
+// periodic work.
 //
-// 1. Overall tunnel failure: the tunnel sends a signal to the ClosedSignal
-// channel on keep-alive failure and other transport I/O errors. In case
-// of such a failure, the tunnel is marked as failed.
+// BytesTransferred and TotalBytesTransferred notices are emitted
+// for live reporting and diagnostics reporting, respectively.
 //
-// 2. Tunnel port forward failures: the tunnel connection may stay up but
-// the client may still fail to establish port forwards due to server load
-// and other conditions. After a threshold number of such failures, the
-// overall tunnel is marked as failed.
+// Status requests are sent to the Psiphon API to report bytes
+// transferred.
 //
-// TODO: currently, any connect (dial), read, or write error associated with
-// a port forward is counted as a failure. It may be important to differentiate
-// between failures due to Psiphon server conditions and failures due to the
-// origin/target server (in the latter case, the tunnel is healthy). Here are
-// some typical error messages to consider matching against (or ignoring):
+// Periodic SSH keep alive packets are sent to ensure the underlying
+// TCP connection isn't terminated by NAT, or other network
+// interference -- or test if it has been terminated while the device
+// has been asleep. When a keep alive times out, the tunnel is
+// considered failed.
 //
-// - "ssh: rejected: administratively prohibited (open failed)"
-//   (this error message is reported in both actual and false cases: when a server
-//    is overloaded and has no free ephemeral ports; and when the user mistypes
-//    a domain in a browser address bar and name resolution fails)
-// - "ssh: rejected: connect failed (Connection timed out)"
-// - "write tcp ... broken pipe"
-// - "read tcp ... connection reset by peer"
-// - "ssh: unexpected packet in response to channel open: <nil>"
+// An immediate SSH keep alive "probe" is sent to test the tunnel and
+// server responsiveness when a port forward failure is detected: a
+// failed dial or failed read/write. This keep alive has a shorter
+// timeout.
 //
-func (tunnel *Tunnel) operateTunnel(config *Config, tunnelOwner TunnelOwner) {
+// Note that port foward failures may be due to non-failure conditions.
+// For example, when the user inputs an invalid domain name and
+// resolution is done by the ssh server; or trying to connect to a
+// non-white-listed port; and the error message in these cases is not
+// distinguishable from a a true server error (a common error message,
+// "ssh: rejected: administratively prohibited (open failed)", may be
+// returned for these cases but also if the server has run out of
+// ephemeral ports, for example).
+//
+// SSH keep alives are not sent when the tunnel has been recently
+// active (not only does tunnel activity obviate the necessity of a keep
+// alive, testing has shown that keep alives may time out for "busy"
+// tunnels, especially over meek protocol and other high latency
+// conditions).
+//
+// "Recently active" is defined has having received payload bytes. Sent
+// bytes are not considered as testing has shown bytes may appear to
+// send when certain NAT devices have interfered with the tunnel, while
+// no bytes are received. In a pathological case, with DNS implemented
+// as tunneled UDP, a browser may wait excessively for a domain name to
+// resolve, while no new port forward is attempted which would otherwise
+// result in a tunnel failure detection.
+//
+// TODO: change "recently active" to include having received any
+// SSH protocol messages from the server, not just user payload?
+//
+func (tunnel *Tunnel) operateTunnel(tunnelOwner TunnelOwner) {
 	defer tunnel.operateWaitGroup.Done()
+
+	lastBytesReceivedTime := time.Now()
+
+	lastTotalBytesTransferedTime := time.Now()
+	totalSent := int64(0)
+	totalReceived := int64(0)
+
+	noticeBytesTransferredTicker := time.NewTicker(1 * time.Second)
+	defer noticeBytesTransferredTicker.Stop()
 
 	// The next status request and ssh keep alive times are picked at random,
 	// from a range, to make the resulting traffic less fingerprintable,
-	// especially when then tunnel is otherwise idle.
 	// Note: not using Tickers since these are not fixed time periods.
-
 	nextStatusRequestPeriod := func() time.Duration {
 		return MakeRandomPeriod(
 			PSIPHON_API_STATUS_REQUEST_PERIOD_MIN,
 			PSIPHON_API_STATUS_REQUEST_PERIOD_MAX)
 	}
+
+	statsTimer := time.NewTimer(nextStatusRequestPeriod())
+	defer statsTimer.Stop()
+
+	// Schedule an immediate status request to deliver any unreported
+	// tunnel stats.
+	// Note: this may not be effective when there's an outstanding
+	// asynchronous untunneled final status request is holding the
+	// tunnel stats records. It may also conflict with other
+	// tunnel candidates which attempt to send an immediate request
+	// before being discarded. For now, we mitigate this with a short,
+	// random delay.
+	unreported := CountUnreportedTunnelStats()
+	if unreported > 0 {
+		NoticeInfo("Unreported tunnel stats: %d", unreported)
+		statsTimer.Reset(MakeRandomPeriod(
+			PSIPHON_API_STATUS_REQUEST_SHORT_PERIOD_MIN,
+			PSIPHON_API_STATUS_REQUEST_SHORT_PERIOD_MAX))
+	}
+
 	nextSshKeepAlivePeriod := func() time.Duration {
 		return MakeRandomPeriod(
 			TUNNEL_SSH_KEEP_ALIVE_PERIOD_MIN,
 			TUNNEL_SSH_KEEP_ALIVE_PERIOD_MAX)
 	}
 
-	statsTimer := time.NewTimer(nextStatusRequestPeriod())
-	defer statsTimer.Stop()
-
+	// TODO: don't initialize timer when config.DisablePeriodicSshKeepAlive is set
 	sshKeepAliveTimer := time.NewTimer(nextSshKeepAlivePeriod())
-	defer sshKeepAliveTimer.Stop()
+	if tunnel.config.DisablePeriodicSshKeepAlive {
+		sshKeepAliveTimer.Stop()
+	} else {
+		defer sshKeepAliveTimer.Stop()
+	}
 
-	var err error
-	for err == nil {
-		select {
-		case <-statsTimer.C:
+	// Perform network requests in separate goroutines so as not to block
+	// other operations.
+	requestsWaitGroup := new(sync.WaitGroup)
+
+	requestsWaitGroup.Add(1)
+	signalStatusRequest := make(chan struct{})
+	go func() {
+		defer requestsWaitGroup.Done()
+		for _ = range signalStatusRequest {
 			sendStats(tunnel)
+		}
+	}()
+
+	requestsWaitGroup.Add(1)
+	signalSshKeepAlive := make(chan time.Duration)
+	sshKeepAliveError := make(chan error, 1)
+	go func() {
+		defer requestsWaitGroup.Done()
+		for timeout := range signalSshKeepAlive {
+			err := sendSshKeepAlive(tunnel.sshClient, tunnel.conn, timeout)
+			if err != nil {
+				select {
+				case sshKeepAliveError <- err:
+				default:
+				}
+			}
+		}
+	}()
+
+	shutdown := false
+	var err error
+	for !shutdown && err == nil {
+		select {
+		case <-noticeBytesTransferredTicker.C:
+			sent, received := transferstats.ReportRecentBytesTransferredForServer(
+				tunnel.serverEntry.IpAddress)
+
+			if received > 0 {
+				lastBytesReceivedTime = time.Now()
+			}
+
+			totalSent += sent
+			totalReceived += received
+
+			if lastTotalBytesTransferedTime.Add(TOTAL_BYTES_TRANSFERRED_NOTICE_PERIOD).Before(time.Now()) {
+				NoticeTotalBytesTransferred(tunnel.serverEntry.IpAddress, totalSent, totalReceived)
+				lastTotalBytesTransferedTime = time.Now()
+			}
+
+			// Only emit the frequent BytesTransferred notice when tunnel is not idle.
+			if tunnel.config.EmitBytesTransferred && (sent > 0 || received > 0) {
+				NoticeBytesTransferred(tunnel.serverEntry.IpAddress, sent, received)
+			}
+
+		case <-statsTimer.C:
+			select {
+			case signalStatusRequest <- *new(struct{}):
+			default:
+			}
 			statsTimer.Reset(nextStatusRequestPeriod())
 
 		case <-sshKeepAliveTimer.C:
-			// Random padding to frustrate fingerprinting
-			_, _, err := tunnel.sshClient.SendRequest(
-				"keepalive@openssh.com", true,
-				MakeSecureRandomPadding(0, TUNNEL_SSH_KEEP_ALIVE_PAYLOAD_MAX_BYTES))
-			err = fmt.Errorf("ssh keep alive failed: %s", err)
+			if lastBytesReceivedTime.Add(TUNNEL_SSH_KEEP_ALIVE_PERIODIC_INACTIVE_PERIOD).Before(time.Now()) {
+				select {
+				case signalSshKeepAlive <- TUNNEL_SSH_KEEP_ALIVE_PERIODIC_TIMEOUT:
+				default:
+				}
+			}
 			sshKeepAliveTimer.Reset(nextSshKeepAlivePeriod())
 
-		case failures := <-tunnel.portForwardFailures:
+		case <-tunnel.signalPortForwardFailure:
 			// Note: no mutex on portForwardFailureTotal; only referenced here
-			tunnel.portForwardFailureTotal += failures
+			tunnel.totalPortForwardFailures++
 			NoticeInfo("port forward failures for %s: %d",
-				tunnel.serverEntry.IpAddress, tunnel.portForwardFailureTotal)
-			if tunnel.portForwardFailureTotal > config.PortForwardFailureThreshold {
-				err = errors.New("tunnel exceeded port forward failure threshold")
+				tunnel.serverEntry.IpAddress, tunnel.totalPortForwardFailures)
+
+			if lastBytesReceivedTime.Add(TUNNEL_SSH_KEEP_ALIVE_PROBE_INACTIVE_PERIOD).Before(time.Now()) {
+				select {
+				case signalSshKeepAlive <- TUNNEL_SSH_KEEP_ALIVE_PROBE_TIMEOUT:
+				default:
+				}
+			}
+			if !tunnel.config.DisablePeriodicSshKeepAlive {
+				sshKeepAliveTimer.Reset(nextSshKeepAlivePeriod())
 			}
 
-		case <-tunnel.closedSignal:
-			err = errors.New("tunnel closed unexpectedly")
+		case err = <-sshKeepAliveError:
 
 		case <-tunnel.shutdownOperateBroadcast:
-			// Attempt to send any remaining stats
-			sendStats(tunnel)
-			NoticeInfo("shutdown operate tunnel")
-			return
+			shutdown = true
 		}
 	}
 
-	if err != nil {
+	close(signalSshKeepAlive)
+	close(signalStatusRequest)
+	requestsWaitGroup.Wait()
+
+	// Capture bytes transferred since the last noticeBytesTransferredTicker tick
+	sent, received := transferstats.ReportRecentBytesTransferredForServer(tunnel.serverEntry.IpAddress)
+	totalSent += sent
+	totalReceived += received
+
+	// Always emit a final NoticeTotalBytesTransferred
+	NoticeTotalBytesTransferred(tunnel.serverEntry.IpAddress, totalSent, totalReceived)
+
+	// The stats for this tunnel will be reported via the next successful
+	// status request.
+	// Note: Since client clocks are unreliable, we use the server's reported
+	// timestamp in the handshake response as the tunnel start time. This time
+	// will be slightly earlier than the actual tunnel activation time, as the
+	// client has to receive and parse the response and activate the tunnel.
+	if !tunnel.IsDiscarded() {
+		err := RecordTunnelStats(
+			tunnel.serverContext.sessionId,
+			tunnel.serverContext.tunnelNumber,
+			tunnel.serverEntry.IpAddress,
+			tunnel.serverContext.serverHandshakeTimestamp,
+			fmt.Sprintf("%d", time.Now().Sub(tunnel.startTime)),
+			totalSent,
+			totalReceived)
+		if err != nil {
+			NoticeAlert("RecordTunnelStats failed: %s", ContextError(err))
+		}
+	}
+
+	// Final status request notes:
+	//
+	// It's highly desirable to send a final status request in order to report
+	// domain bytes transferred stats as well as to report tunnel stats as
+	// soon as possible. For this reason, we attempt untunneled requests when
+	// the tunneled request isn't possible or has failed.
+	//
+	// In an orderly shutdown (err == nil), the Controller is stopping and
+	// everything must be wrapped up quickly. Also, we still have a working
+	// tunnel. So we first attempt a tunneled status request (with a short
+	// timeout) and then attempt, synchronously -- otherwise the Contoller's
+	// untunneledPendingConns.CloseAll() will immediately interrupt untunneled
+	// requests -- untunneled requests (also with short timeouts).
+	// Note that this depends on the order of untunneledPendingConns.CloseAll()
+	// coming after tunnel.Close(): see note in Controller.Run().
+	//
+	// If the tunnel has failed, the Controller may continue working. We want
+	// to re-establish as soon as possible (so don't want to block on status
+	// requests, even for a second). We may have a long time to attempt
+	// untunneled requests in the background. And there is no tunnel through
+	// which to attempt tunneled requests. So we spawn a goroutine to run the
+	// untunneled requests, which are allowed a longer timeout. These requests
+	// will be interrupted by the Controller's untunneledPendingConns.CloseAll()
+	// in the case of a shutdown.
+
+	if err == nil {
+		NoticeInfo("shutdown operate tunnel")
+		if !sendStats(tunnel) {
+			sendUntunneledStats(tunnel, true)
+		}
+	} else {
 		NoticeAlert("operate tunnel error for %s: %s", tunnel.serverEntry.IpAddress, err)
+		go sendUntunneledStats(tunnel, false)
 		tunnelOwner.SignalTunnelFailure(tunnel)
 	}
 }
 
-// sendStats is a helper for sending session stats to the server.
-func sendStats(tunnel *Tunnel) {
+// sendSshKeepAlive is a helper which sends a keepalive@openssh.com request
+// on the specified SSH connections and returns true of the request succeeds
+// within a specified timeout.
+func sendSshKeepAlive(
+	sshClient *ssh.Client, conn net.Conn, timeout time.Duration) error {
 
-	// Tunnel does not have a session when DisableApi is set
-	if tunnel.session == nil {
+	errChannel := make(chan error, 2)
+	time.AfterFunc(timeout, func() {
+		errChannel <- TimeoutError{}
+	})
+
+	go func() {
+		// Random padding to frustrate fingerprinting
+		_, _, err := sshClient.SendRequest(
+			"keepalive@openssh.com", true,
+			MakeSecureRandomPadding(0, TUNNEL_SSH_KEEP_ALIVE_PAYLOAD_MAX_BYTES))
+		errChannel <- err
+	}()
+
+	err := <-errChannel
+	if err != nil {
+		sshClient.Close()
+		conn.Close()
+	}
+
+	return ContextError(err)
+}
+
+// sendStats is a helper for sending session stats to the server.
+func sendStats(tunnel *Tunnel) bool {
+
+	// Tunnel does not have a serverContext when DisableApi is set
+	if tunnel.serverContext == nil {
+		return true
+	}
+
+	// Skip when tunnel is discarded
+	if tunnel.IsDiscarded() {
+		return true
+	}
+
+	err := tunnel.serverContext.DoStatusRequest(tunnel)
+	if err != nil {
+		NoticeAlert("DoStatusRequest failed for %s: %s", tunnel.serverEntry.IpAddress, err)
+	}
+
+	return err == nil
+}
+
+// sendUntunnelStats sends final status requests directly to Psiphon
+// servers after the tunnel has already failed. This is an attempt
+// to retain useful bytes transferred stats.
+func sendUntunneledStats(tunnel *Tunnel, isShutdown bool) {
+
+	// Tunnel does not have a serverContext when DisableApi is set
+	if tunnel.serverContext == nil {
 		return
 	}
 
-	payload := transferstats.GetForServer(tunnel.serverEntry.IpAddress)
-	if payload != nil {
-		err := tunnel.session.DoStatusRequest(payload)
-		if err != nil {
-			NoticeAlert("DoStatusRequest failed for %s: %s", tunnel.serverEntry.IpAddress, err)
-			transferstats.PutBack(tunnel.serverEntry.IpAddress, payload)
-		}
+	// Skip when tunnel is discarded
+	if tunnel.IsDiscarded() {
+		return
+	}
+
+	err := TryUntunneledStatusRequest(tunnel, isShutdown)
+	if err != nil {
+		NoticeAlert("TryUntunneledStatusRequest failed for %s: %s", tunnel.serverEntry.IpAddress, err)
 	}
 }

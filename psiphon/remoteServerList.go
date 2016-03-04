@@ -21,6 +21,7 @@ package psiphon
 
 import (
 	"errors"
+	"fmt"
 	"io/ioutil"
 	"net/http"
 )
@@ -39,15 +40,13 @@ func FetchRemoteServerList(config *Config, dialConfig *DialConfig) (err error) {
 		return ContextError(errors.New("remote server list signature public key blank"))
 	}
 
-	transport := &http.Transport{
-		Dial: NewTCPDialer(dialConfig),
-	}
-	httpClient := http.Client{
-		Timeout:   FETCH_REMOTE_SERVER_LIST_TIMEOUT,
-		Transport: transport,
+	httpClient, requestUrl, err := MakeUntunneledHttpsClient(
+		dialConfig, nil, config.RemoteServerListUrl, FETCH_REMOTE_SERVER_LIST_TIMEOUT)
+	if err != nil {
+		return ContextError(err)
 	}
 
-	request, err := http.NewRequest("GET", config.RemoteServerListUrl, nil)
+	request, err := http.NewRequest("GET", requestUrl, nil)
 	if err != nil {
 		return ContextError(err)
 	}
@@ -61,6 +60,12 @@ func FetchRemoteServerList(config *Config, dialConfig *DialConfig) (err error) {
 	}
 
 	response, err := httpClient.Do(request)
+
+	if err == nil &&
+		(response.StatusCode != http.StatusOK && response.StatusCode != http.StatusNotModified) {
+		response.Body.Close()
+		err = fmt.Errorf("unexpected response status code: %d", response.StatusCode)
+	}
 	if err != nil {
 		return ContextError(err)
 	}
@@ -81,7 +86,10 @@ func FetchRemoteServerList(config *Config, dialConfig *DialConfig) (err error) {
 		return ContextError(err)
 	}
 
-	serverEntries, err := DecodeAndValidateServerEntryList(remoteServerList)
+	serverEntries, err := DecodeAndValidateServerEntryList(
+		remoteServerList,
+		GetCurrentTimestamp(),
+		SERVER_ENTRY_SOURCE_REMOTE)
 	if err != nil {
 		return ContextError(err)
 	}

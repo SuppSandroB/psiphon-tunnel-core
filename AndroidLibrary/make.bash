@@ -1,40 +1,45 @@
 #!/usr/bin/env bash
 
 set -e
-#set -exv # verbose output for testing
 
 if [ ! -f make.bash ]; then
-  echo 'make.bash must be run from $GOPATH/src/github.com/Psiphon-Labs/psiphon-tunnel-core/AndroidLibrary'
+  echo "make.bash must be run from $GOPATH/src/github.com/Psiphon-Labs/psiphon-tunnel-core/AndroidLibrary"
   exit 1
 fi
 
-# Make sure we have our dependencies
-echo -e "go-getting dependencies...\n"
-go get -d -v ./...
+GOOS=arm go get -d -v github.com/Psiphon-Inc/openssl
+GOOS=arm go get -d -v ./...
+if [ $? != 0 ]; then
+  echo "..'go get' failed, exiting"
+  exit $?
+fi
 
-# Force an update of the go-mobile package, since it's being improved rapidly
-# NOTE: for some reason this either doesn't complete or stalls for a very long time.
-#echo -e "Updating go-mobile...\n"
-#go get -u -d -v golang.org/x/mobile/...
-
-LIB_BASENAME="libgojni"
-BUILDINFOFILE="${LIB_BASENAME}_buildinfo.txt"
 BUILDDATE=$(date --iso-8601=seconds)
 BUILDREPO=$(git config --get remote.origin.url)
-BUILDREV=$(git rev-parse HEAD)
+BUILDREV=$(git rev-parse --short HEAD)
+GOVERSION=$(go version | perl -ne '/go version (.*?) / && print $1')
+GOMOBILEVERSION=$(gomobile version | perl -ne '/gomobile version (.*?) / && print $1')
+
 LDFLAGS="\
--X github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon.buildDate $BUILDDATE \
--X github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon.buildRepo $BUILDREPO \
--X github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon.buildRev $BUILDREV \
+-X github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon.buildDate=$BUILDDATE \
+-X github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon.buildRepo=$BUILDREPO \
+-X github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon.buildRev=$BUILDREV \
+-X github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon.goVersion=$GOVERSION \
+-X github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon.gomobileVersion=$GOMOBILEVERSION \
 "
-echo -e "${BUILDDATE}\n${BUILDREPO}\n${BUILDREV}\n" > $BUILDINFOFILE
-echo -e "LDFLAGS=$LDFLAGS\n"
 
-echo -e "Building library...\n"
-CGO_ENABLED=1 GOOS=android GOARCH=arm GOARM=7 \
-  go build -a -v -ldflags="-shared $LDFLAGS" -o ${LIB_BASENAME}.so ./libpsi
+echo "Variables for ldflags:"
+echo " Build date: ${BUILDDATE}"
+echo " Build repo: ${BUILDREPO}"
+echo " Build revision: ${BUILDREV}"
+echo " Go version: ${GOVERSION}"
+echo " Gomobile version: ${GOMOBILEVERSION}"
+echo ""
 
-mkdir -p libs/armeabi-v7a
-mv -f ${LIB_BASENAME}.so libs/armeabi-v7a/${LIB_BASENAME}.so
+gomobile bind -v -ldflags="$LDFLAGS" github.com/Psiphon-Labs/psiphon-tunnel-core/AndroidLibrary/psi
+if [ $? != 0 ]; then
+  echo "..'gomobile bind' failed, exiting"
+  exit $?
+fi
 
-echo -e "Library can be found at: libs/armeabi-v7a/${LIB_BASENAME}.so\n"
+echo "Done"

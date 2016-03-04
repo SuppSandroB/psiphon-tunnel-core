@@ -1,98 +1,60 @@
-Psiphon Library for Android README
-================================================================================
+##Psiphon Android Library README
 
-Overview
---------------------------------------------------------------------------------
+###Overview
 
 Psiphon Library for Android enables you to easily embed Psiphon in your Android
 app. The Psiphon Library for Android is implemented in Go and follows the standard
 conventions for using a Go library in an Android app.
 
-Status
---------------------------------------------------------------------------------
-
-* Pre-release
-
-Building From Source
---------------------------------------------------------------------------------
-
-Follow Go Android documentation:
-* [Overview README](https://code.google.com/p/go/source/browse/README?repo=mobile)
-* [Sample JNI App README](https://code.google.com/p/go/source/browse/example/libhello/README?repo=mobile)
-* [gobind documentation](http://godoc.org/golang.org/x/mobile/cmd/gobind)
-
-```
-/AndroidLibrary
-  README.md                - this file
-  libgojni.so              - build binary output
-  /psi
-    psi.go                 - main library source
-  /go_psi
-    go_psi.go              - gobind output
-  /java_psi/go/psi
-    Psi.java               - gobind output
-  /java_golang/go
-    Go.java                - fork of Go/Java integration file
-    Seq.java               - fork of Go/Java integration file
-  /libpsi
-    main.go                - stub main package for library
-```
-
-* Requires Go 1.4 or later.
-* Install Go from source. The Android instructions are here:
-[https://code.google.com/p/go/source/browse/README?repo=mobile](https://code.google.com/p/go/source/browse/README?repo=mobile).
-  * In summary, download and install the Android NDK, use a script to make a [standalone toolchain](https://developer.android.com/tools/sdk/ndk/index.html#Docs), and use that toolchain to build android/arm support within the Go source install. Then cross compile as usual.
-* `$GOPATH/bin/gobind -lang=go github.com/Psiphon-Labs/psiphon-tunnel-core/AndroidLibrary/psi > go_psi/go_psi.go`
-* `$GOPATH/bin/gobind -lang=java github.com/Psiphon-Labs/psiphon-tunnel-core/AndroidLibrary/psi > java_psi/go/psi/Psi.java`
-* In `/libpsi` `CGO_ENABLED=1 GOOS=android GOARCH=arm GOARM=7 go build -ldflags="-shared"` and copy output file to `gojni.so`
-
-### Building with Docker
+###Building with Docker
 
 Note that you may need to use `sudo docker` below, depending on your OS.
 
-Create the build image:
+#####Create the build image:
 
-```bash
-# While in the same directory as the Dockerfile...
-$ docker build --no-cache=true -t psigoandroid .
-# That will take a long time to complete.
-# After it's done, you'll have an image called "psigoandroid". Check with...
-$ docker images
-```
+  1. Run the command: `docker build --no-cache=true -t psiandroid .` (this may take some time to complete)
+  2. Once completed, verify that you see an image named `psiandroid` when running: `docker images`
 
-To do the build:
+#####Run the build:
 
-```bash
-$ docker run --rm -v $GOPATH/src:/src psigoandroid /bin/bash -c 'cd /src/github.com/Psiphon-Labs/psiphon-tunnel-core/AndroidLibrary && ./make.bash'
-```
+  *Ensure that the command below is run from within the `AndroidLibrary` directory*
 
-When that command completes, the compiled library will be located at `libs/armeabi-v7a/libgojni.so`.
+  ```bash
+  cd .. && \
+    docker run \
+    --rm \
+    -v $(pwd):/go/src/github.com/Psiphon-Labs/psiphon-tunnel-core \
+    psiandroid \
+    /bin/bash -c 'source /tmp/setenv-android.sh && cd /go/src/github.com/Psiphon-Labs/psiphon-tunnel-core/AndroidLibrary && ./make.bash' \
+  ; cd -
+  ```
+When that command completes, the compiled `.aar` file (suitable for use in an Android Studio project) will be located in the current directory (it will likely be owned by root, so be sure to `chown` to an appropriate user).
 
+###Building without Docker (from source)
 
-Using
---------------------------------------------------------------------------------
+#####Prerequisites:
 
-1. Build the shared object library from source or use the [binary release](https://github.com/Psiphon-Labs/psiphon-tunnel-core/releases) and Java source files
-1. Add Go/Java integration files `java_golang/go/*.java` to your `$src/go`
-1. Add `java_psi/go/psi/Psi.java` to your `$src/go/psi`
-1. Add `libgojni.so` to your Android app
+ - The `build-essential` package (on Debian based systems - or its equivalent for your platform)
+ - Go 1.5 or later
+ - Full JDK
+ - Android NDK
+ - Android SDK
+ - OpenSSL (tested against the version [here](../openssl))
+  - Follow its [README](../openssl/README.md) to prepare the environment before you follow the steps below
 
-NOTE: may change to Psiphon-specific library name and init.
+#####Steps:
 
-[AndroidApp README](../AndroidApp/README.md)
+ 1. Follow Go Android documentation ([gomobile documentation](https://godoc.org/golang.org/x/mobile/cmd/gomobile))
+ - Build command: `gomobile bind -target=android github.com/Psiphon-Labs/psiphon-tunnel-core/AndroidLibrary/psi`
+  - Record build version info, as described [here](../README.md#setup), by passing a `-ldflags` argument to `gomobile bind`.
+  - Output: `psi.aar`
 
-See sample usage in [Psiphon.java](../AndroidApp/app/src/main/java/ca/psiphon/psibot/Psiphon.java). Uses `gobind` conventions for data passing.
+###Using the Library
 
-1. Embed a [config file](../README.md#setup)
-1. Call `Go.init(getApplicationContext());` in `Application.onCreate()`
-1. Extend `Psi.Listener.Stub` to receive messages in `Message(String line)`
-1. Call `Psi.Start(configFile, Psi.Listener)` to start Psiphon. Catch `Exception` to receive errors.
-1. Call `Psi.Stop()` to stop Psiphon.
-1. Sample shows how to monitor messages and detect which proxy ports to use and when the tunnel is active.
+ 1. Build `psi.aar` from via the docker container, from source, or use the [binary release](https://github.com/Psiphon-Labs/psiphon-tunnel-core/releases)
+ 2. Add `psi.aar` to your Android Studio project as described in the [gomobile documentation](https://godoc.org/golang.org/x/mobile/cmd/gomobile)
+ 3. Example usage in [TunneledWebView sample app](../SampleApps/TunneledWebView/README.md)
 
-NOTE: may add more explicit interface for state change events.
+#####Limitations
 
-Limitations
---------------------------------------------------------------------------------
-
-* Only supports one concurrent instance of Psiphon.
+ - Only supports one concurrent instance of Psiphon.

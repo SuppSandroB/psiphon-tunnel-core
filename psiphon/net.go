@@ -20,12 +20,16 @@
 package psiphon
 
 import (
-	"bufio"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
 	"net/http"
+	"net/url"
+	"reflect"
 	"sync"
 	"time"
 
@@ -38,19 +42,23 @@ const DNS_PORT = 53
 // of a Psiphon dialer (TCPDial, MeekDial, etc.)
 type DialConfig struct {
 
-	// UpstreamHttpProxyAddress specifies an HTTP proxy to connect through
-	// (the proxy must support HTTP CONNECT). The address may be a hostname
-	// or IP address and must include a port number.
-	UpstreamHttpProxyAddress string
+	// UpstreamProxyUrl specifies a proxy to connect through.
+	// E.g., "http://proxyhost:8080"
+	//       "socks5://user:password@proxyhost:1080"
+	//       "socks4a://proxyhost:1080"
+	//       "http://NTDOMAIN\NTUser:password@proxyhost:3375"
+	//
+	// Certain tunnel protocols require HTTP CONNECT support
+	// when a HTTP proxy is specified. If CONNECT is not
+	// supported, those protocols will not connect.
+	UpstreamProxyUrl string
 
 	ConnectTimeout time.Duration
-	ReadTimeout    time.Duration
-	WriteTimeout   time.Duration
 
-	// PendingConns is used to interrupt dials in progress.
-	// The dial may be interrupted using PendingConns.CloseAll(): on platforms
-	// that support this, the new conn is added to pendingConns before the network
-	// connect begins and removed from pendingConns once the connect succeeds or fails.
+	// PendingConns is used to track and interrupt dials in progress.
+	// Dials may be interrupted using PendingConns.CloseAll(). Once instantiated,
+	// a conn is added to pendingConns before the network connect begins and
+	// removed from pendingConns once the connect succeeds or fails.
 	PendingConns *Conns
 
 	// BindToDevice parameters are used to exclude connections and
@@ -63,6 +71,30 @@ type DialConfig struct {
 	// current active untunneled network DNS server.
 	DeviceBinder    DeviceBinder
 	DnsServerGetter DnsServerGetter
+
+	// UseIndistinguishableTLS specifies whether to try to use an
+	// alternative stack for TLS. From a circumvention perspective,
+	// Go's TLS has a distinct fingerprint that may be used for blocking.
+	// Only applies to TLS connections.
+	UseIndistinguishableTLS bool
+
+	// TrustedCACertificatesFilename specifies a file containing trusted
+	// CA certs. The file contents should be compatible with OpenSSL's
+	// SSL_CTX_load_verify_locations.
+	// Only applies to UseIndistinguishableTLS connections.
+	TrustedCACertificatesFilename string
+
+	// DeviceRegion is the reported region the host device is running in.
+	// When set, this value may be used, pre-connection, to select performance
+	// or circumvention optimization strategies for the given region.
+	DeviceRegion string
+
+	// ResolvedIPCallback, when set, is called with the IP address that was
+	// dialed. This is either the specified IP address in the dial address,
+	// or the resolved IP address in the case where the dial address is a
+	// domain name.
+	// The callback may be invoked by a concurrent goroutine.
+	ResolvedIPCallback func(string)
 }
 
 // DeviceBinder defines the interface to the external BindToDevice provider
@@ -79,26 +111,19 @@ type NetworkConnectivityChecker interface {
 
 // DnsServerGetter defines the interface to the external GetDnsServer provider
 type DnsServerGetter interface {
-	GetDnsServer() string
+	GetPrimaryDnsServer() string
+	GetSecondaryDnsServer() string
 }
+
+// TimeoutError implements the error interface
+type TimeoutError struct{}
+
+func (TimeoutError) Error() string   { return "timed out" }
+func (TimeoutError) Timeout() bool   { return true }
+func (TimeoutError) Temporary() bool { return true }
 
 // Dialer is a custom dialer compatible with http.Transport.Dial.
 type Dialer func(string, string) (net.Conn, error)
-
-// Conn is a net.Conn which supports sending a signal to a channel when
-// it is closed. In Psiphon, this interface is implemented by tunnel
-// connection types (DirectConn and MeekConn) and the close signal is
-// used as one trigger for tearing down the tunnel.
-type Conn interface {
-	net.Conn
-
-	// SetClosedSignal sets the channel which will be signaled
-	// when the connection is closed. This function returns false
-	// if the connection is already closed (and would never send
-	// the signal). SetClosedSignal and Close may be called by
-	// concurrent goroutines.
-	SetClosedSignal(closedSignal chan struct{}) bool
-}
 
 // Conns is a synchronized list of Conns that is used to coordinate
 // interrupting a set of goroutines establishing connections, or
@@ -147,66 +172,35 @@ func (conns *Conns) CloseAll() {
 	conns.conns = make(map[net.Conn]bool)
 }
 
-// Relay sends to remoteConn bytes received from localConn,
+// LocalProxyRelay sends to remoteConn bytes received from localConn,
 // and sends to localConn bytes received from remoteConn.
-func Relay(localConn, remoteConn net.Conn) {
+func LocalProxyRelay(proxyType string, localConn, remoteConn net.Conn) {
 	copyWaitGroup := new(sync.WaitGroup)
 	copyWaitGroup.Add(1)
 	go func() {
 		defer copyWaitGroup.Done()
 		_, err := io.Copy(localConn, remoteConn)
 		if err != nil {
-			NoticeAlert("Relay failed: %s", ContextError(err))
+			err = fmt.Errorf("Relay failed: %s", ContextError(err))
+			NoticeLocalProxyError(proxyType, err)
 		}
 	}()
 	_, err := io.Copy(remoteConn, localConn)
 	if err != nil {
-		NoticeAlert("Relay failed: %s", ContextError(err))
+		err = fmt.Errorf("Relay failed: %s", ContextError(err))
+		NoticeLocalProxyError(proxyType, err)
 	}
 	copyWaitGroup.Wait()
-}
-
-// HttpProxyConnect establishes a HTTP CONNECT tunnel to addr through
-// an established network connection to an HTTP proxy. It is assumed that
-// no payload bytes have been sent through the connection to the proxy.
-func HttpProxyConnect(rawConn net.Conn, addr string) (err error) {
-	hostname, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return ContextError(err)
-	}
-
-	// TODO: use the proxy request/response code from net/http/transport.go?
-	connectRequest := fmt.Sprintf(
-		"CONNECT %s HTTP/1.1\r\nHost: %s\r\nConnection: Keep-Alive\r\n\r\n",
-		addr, hostname)
-	_, err = rawConn.Write([]byte(connectRequest))
-	if err != nil {
-		return ContextError(err)
-	}
-
-	// Adapted from dialConn in net/http/transport.go:
-	// Read response.
-	// Okay to use and discard buffered reader here, because
-	// TLS server will not speak until spoken to.
-	response, err := http.ReadResponse(bufio.NewReader(rawConn), nil)
-	if err != nil {
-		return ContextError(err)
-	}
-	if response.StatusCode != 200 {
-		return ContextError(errors.New(response.Status))
-	}
-
-	return nil
 }
 
 // WaitForNetworkConnectivity uses a NetworkConnectivityChecker to
 // periodically check for network connectivity. It returns true if
 // no NetworkConnectivityChecker is provided (waiting is disabled)
-// or if NetworkConnectivityChecker.HasNetworkConnectivity() indicates
-// connectivity. It polls the checker once a second. If a stop is
-// broadcast, false is returned.
+// or when NetworkConnectivityChecker.HasNetworkConnectivity()
+// indicates connectivity. It waits and polls the checker once a second.
+// If any stop is broadcast, false is returned immediately.
 func WaitForNetworkConnectivity(
-	connectivityChecker NetworkConnectivityChecker, stopBroadcast <-chan struct{}) bool {
+	connectivityChecker NetworkConnectivityChecker, stopBroadcasts ...<-chan struct{}) bool {
 	if connectivityChecker == nil || 1 == connectivityChecker.HasNetworkConnectivity() {
 		return true
 	}
@@ -216,10 +210,20 @@ func WaitForNetworkConnectivity(
 		if 1 == connectivityChecker.HasNetworkConnectivity() {
 			return true
 		}
-		select {
-		case <-ticker.C:
-			// Check again
-		case <-stopBroadcast:
+
+		selectCases := make([]reflect.SelectCase, 1+len(stopBroadcasts))
+		selectCases[0] = reflect.SelectCase{
+			Dir: reflect.SelectRecv, Chan: reflect.ValueOf(ticker.C)}
+		for i, stopBroadcast := range stopBroadcasts {
+			selectCases[i+1] = reflect.SelectCase{
+				Dir: reflect.SelectRecv, Chan: reflect.ValueOf(stopBroadcast)}
+		}
+
+		chosen, _, ok := reflect.Select(selectCases)
+		if chosen == 0 && ok {
+			// Ticker case, so check again
+		} else {
+			// Stop case
 			return false
 		}
 	}
@@ -255,4 +259,102 @@ func ResolveIP(host string, conn net.Conn) (addrs []net.IP, ttls []time.Duration
 		}
 	}
 	return addrs, ttls, nil
+}
+
+// MakeUntunneledHttpsClient returns a net/http.Client which is
+// configured to use custom dialing features -- including BindToDevice,
+// UseIndistinguishableTLS, etc. -- for a specific HTTPS request URL.
+// If verifyLegacyCertificate is not nil, it's used for certificate
+// verification.
+// Because UseIndistinguishableTLS requires a hack to work with
+// net/http, MakeUntunneledHttpClient may return a modified request URL
+// to be used. Callers should always use this return value to make
+// requests, not the input value.
+func MakeUntunneledHttpsClient(
+	dialConfig *DialConfig,
+	verifyLegacyCertificate *x509.Certificate,
+	requestUrl string,
+	requestTimeout time.Duration) (*http.Client, string, error) {
+
+	dialer := NewCustomTLSDialer(
+		// Note: when verifyLegacyCertificate is not nil, some
+		// of the other CustomTLSConfig is overridden.
+		&CustomTLSConfig{
+			Dial: NewTCPDialer(dialConfig),
+			VerifyLegacyCertificate:       verifyLegacyCertificate,
+			SendServerName:                true,
+			SkipVerify:                    false,
+			UseIndistinguishableTLS:       dialConfig.UseIndistinguishableTLS,
+			TrustedCACertificatesFilename: dialConfig.TrustedCACertificatesFilename,
+		})
+
+	urlComponents, err := url.Parse(requestUrl)
+	if err != nil {
+		return nil, "", ContextError(err)
+	}
+
+	// Change the scheme to "http"; otherwise http.Transport will try to do
+	// another TLS handshake inside the explicit TLS session. Also need to
+	// force an explicit port, as the default for "http", 80, won't talk TLS.
+	urlComponents.Scheme = "http"
+	host, port, err := net.SplitHostPort(urlComponents.Host)
+	if err != nil {
+		// Assume there's no port
+		host = urlComponents.Host
+		port = ""
+	}
+	if port == "" {
+		port = "443"
+	}
+	urlComponents.Host = net.JoinHostPort(host, port)
+
+	transport := &http.Transport{
+		Dial: dialer,
+	}
+	httpClient := &http.Client{
+		Timeout:   requestTimeout,
+		Transport: transport,
+	}
+
+	return httpClient, urlComponents.String(), nil
+}
+
+// MakeTunneledHttpClient returns a net/http.Client which is
+// configured to use custom dialing features including tunneled
+// dialing and, optionally, UseTrustedCACertificatesForStockTLS.
+// Unlike MakeUntunneledHttpsClient and makePsiphonHttpsClient,
+// This http.Client uses stock TLS and no scheme transformation
+// hack is required.
+func MakeTunneledHttpClient(
+	config *Config,
+	tunnel *Tunnel,
+	requestTimeout time.Duration) (*http.Client, error) {
+
+	tunneledDialer := func(_, addr string) (conn net.Conn, err error) {
+		return tunnel.sshClient.Dial("tcp", addr)
+	}
+
+	transport := &http.Transport{
+		Dial: tunneledDialer,
+		ResponseHeaderTimeout: requestTimeout,
+	}
+
+	if config.UseTrustedCACertificatesForStockTLS {
+		if config.TrustedCACertificatesFilename == "" {
+			return nil, ContextError(errors.New(
+				"UseTrustedCACertificatesForStockTLS requires TrustedCACertificatesFilename"))
+		}
+		rootCAs := x509.NewCertPool()
+		certData, err := ioutil.ReadFile(config.TrustedCACertificatesFilename)
+		if err != nil {
+			return nil, ContextError(err)
+		}
+		rootCAs.AppendCertsFromPEM(certData)
+		transport.TLSClientConfig = &tls.Config{RootCAs: rootCAs}
+	}
+
+	return &http.Client{
+		Transport: transport,
+		Timeout:   requestTimeout,
+	}, nil
 }

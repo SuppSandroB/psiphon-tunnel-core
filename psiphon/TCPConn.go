@@ -23,120 +23,162 @@ import (
 	"errors"
 	"net"
 	"sync"
-	"time"
+
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/upstreamproxy"
 )
 
 // TCPConn is a customized TCP connection that:
-// - can be interrupted while connecting;
-// - implements idle read/write timeouts;
+// - can be interrupted while dialing;
+// - implements a connect timeout;
+// - uses an upstream proxy when specified, and includes
+//   upstream proxy dialing in the connect timeout;
 // - can be bound to a specific system device (for Android VpnService
-//   routing compatibility, for example).
-// - implements the psiphon.Conn interface
+//   routing compatibility, for example);
 type TCPConn struct {
 	net.Conn
-	mutex         sync.Mutex
-	isClosed      bool
-	closedSignal  chan struct{}
-	interruptible interruptibleTCPSocket
-	readTimeout   time.Duration
-	writeTimeout  time.Duration
+	mutex      sync.Mutex
+	isClosed   bool
+	dialResult chan error
 }
 
 // NewTCPDialer creates a TCPDialer.
 func NewTCPDialer(config *DialConfig) Dialer {
+	return makeTCPDialer(config)
+}
+
+// DialTCP creates a new, connected TCPConn.
+func DialTCP(addr string, config *DialConfig) (conn net.Conn, err error) {
+	return makeTCPDialer(config)("tcp", addr)
+}
+
+// makeTCPDialer creates a custom dialer which creates TCPConn.
+func makeTCPDialer(config *DialConfig) func(network, addr string) (net.Conn, error) {
 	return func(network, addr string) (net.Conn, error) {
 		if network != "tcp" {
-			return nil, errors.New("unsupported network type in NewTCPDialer")
+			return nil, errors.New("unsupported network type in TCPConn dialer")
 		}
-		return DialTCP(addr, config)
+		conn, err := interruptibleTCPDial(addr, config)
+		if err != nil {
+			return nil, ContextError(err)
+		}
+		// Note: when an upstream proxy is used, we don't know what IP address
+		// was resolved, by the proxy, for that destination.
+		if config.ResolvedIPCallback != nil && config.UpstreamProxyUrl == "" {
+			remoteAddr := conn.RemoteAddr()
+			if remoteAddr != nil {
+				host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+				if err == nil {
+					config.ResolvedIPCallback(host)
+				}
+			}
+		}
+		return conn, nil
 	}
 }
 
-// TCPConn creates a new, connected TCPConn.
-func DialTCP(addr string, config *DialConfig) (conn *TCPConn, err error) {
-	conn, err = interruptibleTCPDial(addr, config)
+// interruptibleTCPDial establishes a TCP network connection. A conn is added
+// to config.PendingConns before blocking on network I/O, which enables interruption.
+// The caller is responsible for removing an established conn from PendingConns.
+// An upstream proxy is used when specified.
+//
+// Note: do not to set a UpstreamProxyUrl in the config when using
+// NewTCPDialer as a custom dialer for NewProxyAuthTransport (or http.Transport
+// with a ProxyUrl), as that would result in double proxy chaining.
+//
+// Note: interruption does not actually cancel a connection in progress; it
+// stops waiting for the goroutine blocking on connect()/Dial.
+func interruptibleTCPDial(addr string, config *DialConfig) (*TCPConn, error) {
+
+	// Buffers the first result; senders should discard results when
+	// sending would block, as that means the first result is already set.
+	conn := &TCPConn{dialResult: make(chan error, 1)}
+
+	// Enable interruption
+	if !config.PendingConns.Add(conn) {
+		return nil, ContextError(errors.New("pending connections already closed"))
+	}
+
+	// Call the blocking Connect() in a goroutine. ConnectTimeout is handled
+	// in the platform-specific tcpDial helper function.
+	// Note: since this goroutine may be left running after an interrupt, don't
+	// call Notice() or perform other actions unexpected after a Controller stops.
+	// The lifetime of the goroutine may depend on the host OS TCP connect timeout
+	// when tcpDial, amoung other things, when makes a blocking syscall.Connect()
+	// call.
+	go func() {
+		var netConn net.Conn
+		var err error
+		if config.UpstreamProxyUrl != "" {
+			netConn, err = proxiedTcpDial(addr, config, conn.dialResult)
+		} else {
+			netConn, err = tcpDial(addr, config, conn.dialResult)
+		}
+
+		// Mutex is necessary for referencing conn.isClosed and conn.Conn as
+		// TCPConn.Close may be called while this goroutine is running.
+		conn.mutex.Lock()
+
+		// If already interrupted, cleanup the net.Conn resource and discard.
+		if conn.isClosed && netConn != nil {
+			netConn.Close()
+			conn.mutex.Unlock()
+			return
+		}
+
+		conn.Conn = netConn
+		conn.mutex.Unlock()
+
+		select {
+		case conn.dialResult <- err:
+		default:
+		}
+	}()
+
+	// Wait until Dial completes (or times out) or until interrupt
+	err := <-conn.dialResult
 	if err != nil {
 		return nil, ContextError(err)
 	}
+
 	return conn, nil
 }
 
-// SetClosedSignal implements psiphon.Conn.SetClosedSignal.
-func (conn *TCPConn) SetClosedSignal(closedSignal chan struct{}) bool {
-	conn.mutex.Lock()
-	defer conn.mutex.Unlock()
-	if conn.isClosed {
-		return false
+// proxiedTcpDial wraps a tcpDial call in an upstreamproxy dial.
+func proxiedTcpDial(
+	addr string, config *DialConfig, dialResult chan error) (net.Conn, error) {
+	dialer := func(network, addr string) (net.Conn, error) {
+		return tcpDial(addr, config, dialResult)
 	}
-	conn.closedSignal = closedSignal
-	return true
+	upstreamDialer := upstreamproxy.NewProxyDialFunc(
+		&upstreamproxy.UpstreamProxyConfig{
+			ForwardDialFunc: dialer,
+			ProxyURIString:  config.UpstreamProxyUrl,
+		})
+	netConn, err := upstreamDialer("tcp", addr)
+	if _, ok := err.(*upstreamproxy.Error); ok {
+		NoticeUpstreamProxyError(err)
+	}
+	return netConn, err
 }
 
-// Close terminates a connected (net.Conn) or connecting (socketFd) TCPConn.
-// A mutex is required to support psiphon.Conn.SetClosedSignal concurrency semantics.
+// Close terminates a connected TCPConn or interrupts a dialing TCPConn.
 func (conn *TCPConn) Close() (err error) {
 	conn.mutex.Lock()
 	defer conn.mutex.Unlock()
-	if !conn.isClosed {
-		if conn.Conn == nil {
-			err = interruptibleTCPClose(conn.interruptible)
-		} else {
-			err = conn.Conn.Close()
-		}
-		conn.isClosed = true
-		select {
-		case conn.closedSignal <- *new(struct{}):
-		default:
-		}
+
+	if conn.isClosed {
+		return
 	}
+	conn.isClosed = true
+
+	if conn.Conn != nil {
+		err = conn.Conn.Close()
+	}
+
+	select {
+	case conn.dialResult <- errors.New("dial interrupted"):
+	default:
+	}
+
 	return err
-}
-
-// Read wraps standard Read to add an idle timeout. The connection
-// is explicitly closed on timeout.
-func (conn *TCPConn) Read(buffer []byte) (n int, err error) {
-	// Note: no mutex on the conn.readTimeout access
-	if conn.readTimeout != 0 {
-		err = conn.Conn.SetReadDeadline(time.Now().Add(conn.readTimeout))
-		if err != nil {
-			return 0, ContextError(err)
-		}
-	}
-	n, err = conn.Conn.Read(buffer)
-	if err != nil {
-		conn.Close()
-	}
-	return
-}
-
-// Write wraps standard Write to add an idle timeout The connection
-// is explicitly closed on timeout.
-func (conn *TCPConn) Write(buffer []byte) (n int, err error) {
-	// Note: no mutex on the conn.writeTimeout access
-	if conn.writeTimeout != 0 {
-		err = conn.Conn.SetWriteDeadline(time.Now().Add(conn.writeTimeout))
-		if err != nil {
-			return 0, ContextError(err)
-		}
-	}
-	n, err = conn.Conn.Write(buffer)
-	if err != nil {
-		conn.Close()
-	}
-	return
-}
-
-// Override implementation of net.Conn.SetDeadline
-func (conn *TCPConn) SetDeadline(t time.Time) error {
-	return errors.New("net.Conn SetDeadline not supported")
-}
-
-// Override implementation of net.Conn.SetReadDeadline
-func (conn *TCPConn) SetReadDeadline(t time.Time) error {
-	return errors.New("net.Conn SetReadDeadline not supported")
-}
-
-// Override implementation of net.Conn.SetWriteDeadline
-func (conn *TCPConn) SetWriteDeadline(t time.Time) error {
-	return errors.New("net.Conn SetWriteDeadline not supported")
 }

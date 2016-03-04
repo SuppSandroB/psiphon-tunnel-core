@@ -65,14 +65,17 @@ type HttpProxy struct {
 	stopListeningBroadcast chan struct{}
 }
 
+var _HTTP_PROXY_TYPE = "HTTP"
+
 // NewHttpProxy initializes and runs a new HTTP proxy server.
 func NewHttpProxy(
 	config *Config,
 	untunneledDialConfig *DialConfig,
-	tunneler Tunneler) (proxy *HttpProxy, err error) {
+	tunneler Tunneler,
+	listenIP string) (proxy *HttpProxy, err error) {
 
 	listener, err := net.Listen(
-		"tcp", fmt.Sprintf("127.0.0.1:%d", config.LocalHttpProxyPort))
+		"tcp", fmt.Sprintf("%s:%d", listenIP, config.LocalHttpProxyPort))
 	if err != nil {
 		if IsAddressInUseError(err) {
 			NoticeHttpProxyPortInUse(config.LocalHttpProxyPort)
@@ -225,7 +228,7 @@ func (proxy *HttpProxy) httpConnectHandler(localConn net.Conn, target string) (e
 	if err != nil {
 		return ContextError(err)
 	}
-	Relay(localConn, remoteConn)
+	LocalProxyRelay(_HTTP_PROXY_TYPE, localConn, remoteConn)
 	return nil
 }
 
@@ -396,7 +399,7 @@ func (proxy *HttpProxy) serve() {
 	default:
 		if err != nil {
 			proxy.tunneler.SignalComponentFailure()
-			NoticeAlert("%s", ContextError(err))
+			NoticeLocalProxyError(_HTTP_PROXY_TYPE, ContextError(err))
 		}
 	}
 	NoticeInfo("HTTP proxy stopped")

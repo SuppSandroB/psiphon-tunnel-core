@@ -47,6 +47,9 @@ func main() {
 	var profileFilename string
 	flag.StringVar(&profileFilename, "profile", "", "CPU profile output file")
 
+	var interfaceName string
+	flag.StringVar(&interfaceName, "listenInterface", "", "Interface Name")
+
 	flag.Parse()
 
 	// Initialize default Notice output (stderr)
@@ -57,6 +60,8 @@ func main() {
 		noticeWriter = psiphon.NewNoticeConsoleRewriter(noticeWriter)
 	}
 	psiphon.SetNoticeOutput(noticeWriter)
+
+	psiphon.EmitNoticeBuildInfo()
 
 	// Handle required config file parameter
 
@@ -132,7 +137,10 @@ func main() {
 				return
 			}
 			// TODO: stream embedded server list data? also, the cast makes an unnecessary copy of a large buffer?
-			serverEntries, err := psiphon.DecodeAndValidateServerEntryList(string(serverEntryList))
+			serverEntries, err := psiphon.DecodeAndValidateServerEntryList(
+				string(serverEntryList),
+				psiphon.GetCurrentTimestamp(),
+				psiphon.SERVER_ENTRY_SOURCE_EMBEDDED)
 			if err != nil {
 				psiphon.NoticeError("error decoding embedded server entry list file: %s", err)
 				return
@@ -151,6 +159,10 @@ func main() {
 		} else {
 			defer embeddedServerListWaitGroup.Wait()
 		}
+	}
+
+	if interfaceName != "" {
+		config.ListenInterface = interfaceName
 	}
 
 	// Run Psiphon

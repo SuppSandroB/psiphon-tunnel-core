@@ -26,7 +26,6 @@ package psi
 
 import (
 	"fmt"
-	"log"
 	"sync"
 
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon"
@@ -36,14 +35,18 @@ type PsiphonProvider interface {
 	Notice(noticeJSON string)
 	HasNetworkConnectivity() int
 	BindToDevice(fileDescriptor int) error
-	GetDnsServer() string
+	GetPrimaryDnsServer() string
+	GetSecondaryDnsServer() string
 }
 
 var controller *psiphon.Controller
 var shutdownBroadcast chan struct{}
 var controllerWaitGroup *sync.WaitGroup
 
-func Start(configJson, embeddedServerEntryList string, provider PsiphonProvider) error {
+func Start(
+	configJson, embeddedServerEntryList string,
+	provider PsiphonProvider,
+	useDeviceBinder bool) error {
 
 	if controller != nil {
 		return fmt.Errorf("already started")
@@ -54,13 +57,18 @@ func Start(configJson, embeddedServerEntryList string, provider PsiphonProvider)
 		return fmt.Errorf("error loading configuration file: %s", err)
 	}
 	config.NetworkConnectivityChecker = provider
-	config.DeviceBinder = provider
-	config.DnsServerGetter = provider
+
+	if useDeviceBinder {
+		config.DeviceBinder = provider
+		config.DnsServerGetter = provider
+	}
 
 	psiphon.SetNoticeOutput(psiphon.NewNoticeReceiver(
 		func(notice []byte) {
 			provider.Notice(string(notice))
 		}))
+
+	psiphon.EmitNoticeBuildInfo()
 
 	// TODO: should following errors be Notices?
 
@@ -69,13 +77,16 @@ func Start(configJson, embeddedServerEntryList string, provider PsiphonProvider)
 		return fmt.Errorf("error initializing datastore: %s", err)
 	}
 
-	serverEntries, err := psiphon.DecodeAndValidateServerEntryList(embeddedServerEntryList)
+	serverEntries, err := psiphon.DecodeAndValidateServerEntryList(
+		embeddedServerEntryList,
+		psiphon.GetCurrentTimestamp(),
+		psiphon.SERVER_ENTRY_SOURCE_EMBEDDED)
 	if err != nil {
-		log.Fatalf("error decoding embedded server entry list: %s", err)
+		return fmt.Errorf("error decoding embedded server entry list: %s", err)
 	}
 	err = psiphon.StoreServerEntries(serverEntries, false)
 	if err != nil {
-		log.Fatalf("error storing embedded server entry list: %s", err)
+		return fmt.Errorf("error storing embedded server entry list: %s", err)
 	}
 
 	controller, err = psiphon.NewController(config)

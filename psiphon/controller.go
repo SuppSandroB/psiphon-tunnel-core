@@ -25,6 +25,7 @@ package psiphon
 
 import (
 	"errors"
+	"math/rand"
 	"net"
 	"sync"
 	"time"
@@ -34,31 +35,43 @@ import (
 // connect to; establishes and monitors tunnels; and runs local proxies which
 // route traffic through the tunnels.
 type Controller struct {
-	config                      *Config
-	sessionId                   string
-	componentFailureSignal      chan struct{}
-	shutdownBroadcast           chan struct{}
-	runWaitGroup                *sync.WaitGroup
-	establishedTunnels          chan *Tunnel
-	failedTunnels               chan *Tunnel
-	tunnelMutex                 sync.Mutex
-	establishedOnce             bool
-	tunnels                     []*Tunnel
-	nextTunnel                  int
-	startedConnectedReporter    bool
-	isEstablishing              bool
-	establishWaitGroup          *sync.WaitGroup
-	stopEstablishingBroadcast   chan struct{}
-	candidateServerEntries      chan *ServerEntry
-	establishPendingConns       *Conns
-	untunneledPendingConns      *Conns
-	untunneledDialConfig        *DialConfig
-	splitTunnelClassifier       *SplitTunnelClassifier
-	signalFetchRemoteServerList chan struct{}
+	config                         *Config
+	sessionId                      string
+	componentFailureSignal         chan struct{}
+	shutdownBroadcast              chan struct{}
+	runWaitGroup                   *sync.WaitGroup
+	establishedTunnels             chan *Tunnel
+	failedTunnels                  chan *Tunnel
+	tunnelMutex                    sync.Mutex
+	establishedOnce                bool
+	tunnels                        []*Tunnel
+	nextTunnel                     int
+	startedConnectedReporter       bool
+	startedUpgradeDownloader       bool
+	isEstablishing                 bool
+	establishWaitGroup             *sync.WaitGroup
+	stopEstablishingBroadcast      chan struct{}
+	candidateServerEntries         chan *candidateServerEntry
+	establishPendingConns          *Conns
+	untunneledPendingConns         *Conns
+	untunneledDialConfig           *DialConfig
+	splitTunnelClassifier          *SplitTunnelClassifier
+	signalFetchRemoteServerList    chan struct{}
+	impairedProtocolClassification map[string]int
+	signalReportConnected          chan struct{}
+	serverAffinityDoneBroadcast    chan struct{}
+}
+
+type candidateServerEntry struct {
+	serverEntry               *ServerEntry
+	isServerAffinityCandidate bool
 }
 
 // NewController initializes a new controller.
 func NewController(config *Config) (controller *Controller, err error) {
+
+	// Needed by regen, at least
+	rand.Seed(int64(time.Now().Nanosecond()))
 
 	// Generate a session ID for the Psiphon server API. This session ID is
 	// used across all tunnels established by the controller.
@@ -72,10 +85,13 @@ func NewController(config *Config) (controller *Controller, err error) {
 	// used to exclude these requests and connection from VPN routing.
 	untunneledPendingConns := new(Conns)
 	untunneledDialConfig := &DialConfig{
-		UpstreamHttpProxyAddress: config.UpstreamHttpProxyAddress,
-		PendingConns:             untunneledPendingConns,
-		DeviceBinder:             config.DeviceBinder,
-		DnsServerGetter:          config.DnsServerGetter,
+		UpstreamProxyUrl:              config.UpstreamProxyUrl,
+		PendingConns:                  untunneledPendingConns,
+		DeviceBinder:                  config.DeviceBinder,
+		DnsServerGetter:               config.DnsServerGetter,
+		UseIndistinguishableTLS:       config.UseIndistinguishableTLS,
+		TrustedCACertificatesFilename: config.TrustedCACertificatesFilename,
+		DeviceRegion:                  config.DeviceRegion,
 	}
 
 	controller = &Controller{
@@ -89,18 +105,22 @@ func NewController(config *Config) (controller *Controller, err error) {
 		runWaitGroup:           new(sync.WaitGroup),
 		// establishedTunnels and failedTunnels buffer sizes are large enough to
 		// receive full pools of tunnels without blocking. Senders should not block.
-		establishedTunnels:       make(chan *Tunnel, config.TunnelPoolSize),
-		failedTunnels:            make(chan *Tunnel, config.TunnelPoolSize),
-		tunnels:                  make([]*Tunnel, 0),
-		establishedOnce:          false,
-		startedConnectedReporter: false,
-		isEstablishing:           false,
-		establishPendingConns:    new(Conns),
-		untunneledPendingConns:   untunneledPendingConns,
-		untunneledDialConfig:     untunneledDialConfig,
-		// A buffer allows at least one signal to be sent even when the receiver is
-		// not listening. Senders should not block.
-		signalFetchRemoteServerList: make(chan struct{}, 1),
+		establishedTunnels:             make(chan *Tunnel, config.TunnelPoolSize),
+		failedTunnels:                  make(chan *Tunnel, config.TunnelPoolSize),
+		tunnels:                        make([]*Tunnel, 0),
+		establishedOnce:                false,
+		startedConnectedReporter:       false,
+		startedUpgradeDownloader:       false,
+		isEstablishing:                 false,
+		establishPendingConns:          new(Conns),
+		untunneledPendingConns:         untunneledPendingConns,
+		untunneledDialConfig:           untunneledDialConfig,
+		impairedProtocolClassification: make(map[string]int),
+		// TODO: Add a buffer of 1 so we don't miss a signal while receiver is
+		// starting? Trade-off is potential back-to-back fetch remotes. As-is,
+		// establish will eventually signal another fetch remote.
+		signalFetchRemoteServerList: make(chan struct{}),
+		signalReportConnected:       make(chan struct{}),
 	}
 
 	controller.splitTunnelClassifier = NewSplitTunnelClassifier(config, controller)
@@ -118,13 +138,17 @@ func NewController(config *Config) (controller *Controller, err error) {
 // - a local SOCKS proxy that port forwards through the pool of tunnels
 // - a local HTTP proxy that port forwards through the pool of tunnels
 func (controller *Controller) Run(shutdownBroadcast <-chan struct{}) {
-	NoticeBuildInfo()
-	NoticeCoreVersion(VERSION)
 	ReportAvailableRegions()
 
 	// Start components
 
-	socksProxy, err := NewSocksProxy(controller.config, controller)
+	listenIP, err := GetInterfaceIPAddress(controller.config.ListenInterface)
+	if err != nil {
+		NoticeError("error getting listener IP: %s", err)
+		return
+	}
+
+	socksProxy, err := NewSocksProxy(controller.config, controller, listenIP)
 	if err != nil {
 		NoticeAlert("error initializing local SOCKS proxy: %s", err)
 		return
@@ -132,7 +156,7 @@ func (controller *Controller) Run(shutdownBroadcast <-chan struct{}) {
 	defer socksProxy.Close()
 
 	httpProxy, err := NewHttpProxy(
-		controller.config, controller.untunneledDialConfig, controller)
+		controller.config, controller.untunneledDialConfig, controller, listenIP)
 	if err != nil {
 		NoticeAlert("error initializing local HTTP proxy: %s", err)
 		return
@@ -166,8 +190,18 @@ func (controller *Controller) Run(shutdownBroadcast <-chan struct{}) {
 
 	close(controller.shutdownBroadcast)
 	controller.establishPendingConns.CloseAll()
-	controller.untunneledPendingConns.CloseAll()
 	controller.runWaitGroup.Wait()
+
+	// Stops untunneled connections, including fetch remote server list,
+	// split tunnel port forwards and also untunneled final stats requests.
+	// Note: there's a circular dependency with runWaitGroup.Wait() and
+	// untunneledPendingConns.CloseAll(): runWaitGroup depends on tunnels
+	// stopping which depends, in orderly shutdown, on final status requests
+	// completing. So this pending conns cancel comes too late to interrupt
+	// final status requests in the orderly shutdown case -- which is desired
+	// since we give those a short timeout and would prefer to not interrupt
+	// them.
+	controller.untunneledPendingConns.CloseAll()
 
 	controller.splitTunnelClassifier.Shutdown()
 
@@ -265,7 +299,9 @@ func (controller *Controller) establishTunnelWatcher() {
 // comment in DoConnectedRequest for a description of the request mechanism.
 // To ensure we don't over- or under-count unique users, only one connected
 // request is made across all simultaneous multi-tunnels; and the connected
-// request is repeated periodically.
+// request is repeated periodically for very long-lived tunnels.
+// The signalReportConnected mechanism is used to trigger another connected
+// request immediately after a reconnect.
 func (controller *Controller) connectedReporter() {
 	defer controller.runWaitGroup.Done()
 loop:
@@ -276,7 +312,7 @@ loop:
 		reported := false
 		tunnel := controller.getNextActiveTunnel()
 		if tunnel != nil {
-			err := tunnel.session.DoConnectedRequest()
+			err := tunnel.serverContext.DoConnectedRequest()
 			if err == nil {
 				reported = true
 			} else {
@@ -293,8 +329,10 @@ loop:
 		}
 		timeout := time.After(duration)
 		select {
+		case <-controller.signalReportConnected:
 		case <-timeout:
 			// Make another connected request
+
 		case <-controller.shutdownBroadcast:
 			break loop
 		}
@@ -303,7 +341,8 @@ loop:
 	NoticeInfo("exiting connected reporter")
 }
 
-func (controller *Controller) startConnectedReporter() {
+func (controller *Controller) startOrSignalConnectedReporter() {
+	// session is nil when DisableApi is set
 	if controller.config.DisableApi {
 		return
 	}
@@ -314,6 +353,74 @@ func (controller *Controller) startConnectedReporter() {
 		controller.startedConnectedReporter = true
 		controller.runWaitGroup.Add(1)
 		go controller.connectedReporter()
+	} else {
+		select {
+		case controller.signalReportConnected <- *new(struct{}):
+		default:
+		}
+	}
+}
+
+// upgradeDownloader makes periodic attemps to complete a client upgrade
+// download. DownloadUpgrade() is resumable, so each attempt has potential for
+// getting closer to completion, even in conditions where the download or
+// tunnel is repeatedly interrupted.
+// Once the download is complete, the downloader exits and is not run again:
+// We're assuming that the upgrade will be applied and the entire system
+// restarted before another upgrade is to be downloaded.
+func (controller *Controller) upgradeDownloader(clientUpgradeVersion string) {
+	defer controller.runWaitGroup.Done()
+
+loop:
+	for {
+		// Pick any active tunnel and make the next download attempt. No error
+		// is logged if there's no active tunnel, as that's not an unexpected condition.
+		tunnel := controller.getNextActiveTunnel()
+		if tunnel != nil {
+			err := DownloadUpgrade(controller.config, clientUpgradeVersion, tunnel)
+			if err == nil {
+				break loop
+			}
+			NoticeAlert("upgrade download failed: %s", err)
+		}
+
+		timeout := time.After(DOWNLOAD_UPGRADE_RETRY_PAUSE_PERIOD)
+		select {
+		case <-timeout:
+			// Make another download attempt
+		case <-controller.shutdownBroadcast:
+			break loop
+		}
+	}
+
+	NoticeInfo("exiting upgrade downloader")
+}
+
+func (controller *Controller) startClientUpgradeDownloader(
+	serverContext *ServerContext) {
+
+	// serverContext is nil when DisableApi is set
+	if controller.config.DisableApi {
+		return
+	}
+
+	if controller.config.UpgradeDownloadUrl == "" ||
+		controller.config.UpgradeDownloadFilename == "" {
+		// No upgrade is desired
+		return
+	}
+
+	if serverContext.clientUpgradeVersion == "" {
+		// No upgrade is offered
+		return
+	}
+
+	// Start the client upgrade downloaded after the first tunnel is established.
+	// Concurrency note: only the runTunnels goroutine may access startClientUpgradeDownloader.
+	if !controller.startedUpgradeDownloader {
+		controller.startedUpgradeDownloader = true
+		controller.runWaitGroup.Add(1)
+		go controller.upgradeDownloader(serverContext.clientUpgradeVersion)
 	}
 }
 
@@ -343,6 +450,22 @@ loop:
 		case failedTunnel := <-controller.failedTunnels:
 			NoticeAlert("tunnel failed: %s", failedTunnel.serverEntry.IpAddress)
 			controller.terminateTunnel(failedTunnel)
+
+			// Note: we make this extra check to ensure the shutdown signal takes priority
+			// and that we do not start establishing. Critically, startEstablishing() calls
+			// establishPendingConns.Reset() which clears the closed flag in
+			// establishPendingConns; this causes the pendingConns.Add() within
+			// interruptibleTCPDial to succeed instead of aborting, and the result
+			// is that it's possible for establish goroutines to run all the way through
+			// NewServerContext before being discarded... delaying shutdown.
+			select {
+			case <-controller.shutdownBroadcast:
+				break loop
+			default:
+			}
+
+			controller.classifyImpairedProtocol(failedTunnel)
+
 			// Concurrency note: only this goroutine may call startEstablishing/stopEstablishing
 			// and access isEstablishing.
 			if !controller.isEstablishing {
@@ -352,15 +475,40 @@ loop:
 		// !TODO! design issue: might not be enough server entries with region/caps to ever fill tunnel slots
 		// solution(?) target MIN(CountServerEntries(region, protocol), TunnelPoolSize)
 		case establishedTunnel := <-controller.establishedTunnels:
-			if controller.registerTunnel(establishedTunnel) {
-				NoticeActiveTunnel(establishedTunnel.serverEntry.IpAddress)
+			tunnelCount, registered := controller.registerTunnel(establishedTunnel)
+			if registered {
+				NoticeActiveTunnel(establishedTunnel.serverEntry.IpAddress, establishedTunnel.protocol)
+
+				if tunnelCount == 1 {
+
+					// The split tunnel classifier is started once the first tunnel is
+					// established. This first tunnel is passed in to be used to make
+					// the routes data request.
+					// A long-running controller may run while the host device is present
+					// in different regions. In this case, we want the split tunnel logic
+					// to switch to routes for new regions and not classify traffic based
+					// on routes installed for older regions.
+					// We assume that when regions change, the host network will also
+					// change, and so all tunnels will fail and be re-established. Under
+					// that assumption, the classifier will be re-Start()-ed here when
+					// the region has changed.
+					controller.splitTunnelClassifier.Start(establishedTunnel)
+
+					// Signal a connected request on each 1st tunnel establishment. For
+					// multi-tunnels, the session is connected as long as at least one
+					// tunnel is established.
+					controller.startOrSignalConnectedReporter()
+
+					controller.startClientUpgradeDownloader(
+						establishedTunnel.serverContext)
+				}
+
 			} else {
 				controller.discardTunnel(establishedTunnel)
 			}
 			if controller.isFullyEstablished() {
 				controller.stopEstablishing()
 			}
-			controller.startConnectedReporter()
 
 		case <-controller.shutdownBroadcast:
 			break loop
@@ -383,6 +531,50 @@ loop:
 	}
 
 	NoticeInfo("exiting run tunnels")
+}
+
+// classifyImpairedProtocol tracks "impaired" protocol classifications for failed
+// tunnels. A protocol is classified as impaired if a tunnel using that protocol
+// fails, repeatedly, shortly after the start of the connection. During tunnel
+// establishment, impaired protocols are briefly skipped.
+//
+// One purpose of this measure is to defend against an attack where the adversary,
+// for example, tags an OSSH TCP connection as an "unidentified" protocol; allows
+// it to connect; but then kills the underlying TCP connection after a short time.
+// Since OSSH has less latency than other protocols that may bypass an "unidentified"
+// filter, these other protocols might never be selected for use.
+//
+// Concurrency note: only the runTunnels() goroutine may call classifyImpairedProtocol
+func (controller *Controller) classifyImpairedProtocol(failedTunnel *Tunnel) {
+	if failedTunnel.startTime.Add(IMPAIRED_PROTOCOL_CLASSIFICATION_DURATION).After(time.Now()) {
+		controller.impairedProtocolClassification[failedTunnel.protocol] += 1
+	} else {
+		controller.impairedProtocolClassification[failedTunnel.protocol] = 0
+	}
+	if len(controller.getImpairedProtocols()) == len(SupportedTunnelProtocols) {
+		// Reset classification if all protocols are classified as impaired as
+		// the network situation (or attack) may not be protocol-specific.
+		// TODO: compare against count of distinct supported protocols for
+		// current known server entries.
+		controller.impairedProtocolClassification = make(map[string]int)
+	}
+}
+
+// getImpairedProtocols returns a list of protocols that have sufficient
+// classifications to be considered impaired protocols.
+//
+// Concurrency note: only the runTunnels() goroutine may call getImpairedProtocols
+func (controller *Controller) getImpairedProtocols() []string {
+	if len(controller.impairedProtocolClassification) > 0 {
+		NoticeInfo("impaired protocols: %+v", controller.impairedProtocolClassification)
+	}
+	impairedProtocols := make([]string, 0)
+	for protocol, count := range controller.impairedProtocolClassification {
+		if count >= IMPAIRED_PROTOCOL_CLASSIFICATION_THRESHOLD {
+			impairedProtocols = append(impairedProtocols, protocol)
+		}
+	}
+	return impairedProtocols
 }
 
 // SignalTunnelFailure implements the TunnelOwner interface. This function
@@ -408,46 +600,39 @@ func (controller *Controller) discardTunnel(tunnel *Tunnel) {
 	// discarded tunnel before fully active tunnels. Can a discarded tunnel
 	// be promoted (since it connects), but with lower rank than all active
 	// tunnels?
-	tunnel.Close()
+	tunnel.Close(true)
 }
 
 // registerTunnel adds the connected tunnel to the pool of active tunnels
 // which are candidates for port forwarding. Returns true if the pool has an
 // empty slot and false if the pool is full (caller should discard the tunnel).
-func (controller *Controller) registerTunnel(tunnel *Tunnel) bool {
+func (controller *Controller) registerTunnel(tunnel *Tunnel) (int, bool) {
 	controller.tunnelMutex.Lock()
 	defer controller.tunnelMutex.Unlock()
 	if len(controller.tunnels) >= controller.config.TunnelPoolSize {
-		return false
+		return len(controller.tunnels), false
 	}
 	// Perform a final check just in case we've established
 	// a duplicate connection.
 	for _, activeTunnel := range controller.tunnels {
 		if activeTunnel.serverEntry.IpAddress == tunnel.serverEntry.IpAddress {
 			NoticeAlert("duplicate tunnel: %s", tunnel.serverEntry.IpAddress)
-			return false
+			return len(controller.tunnels), false
 		}
 	}
 	controller.establishedOnce = true
 	controller.tunnels = append(controller.tunnels, tunnel)
 	NoticeTunnels(len(controller.tunnels))
 
-	// The split tunnel classifier is started once the first tunnel is
-	// established. This first tunnel is passed in to be used to make
-	// the routes data request.
-	// A long-running controller may run while the host device is present
-	// in different regions. In this case, we want the split tunnel logic
-	// to switch to routes for new regions and not classify traffic based
-	// on routes installed for older regions.
-	// We assume that when regions change, the host network will also
-	// change, and so all tunnels will fail and be re-established. Under
-	// that assumption, the classifier will be re-Start()-ed here when
-	// the region has changed.
-	if len(controller.tunnels) == 1 {
-		controller.splitTunnelClassifier.Start(tunnel)
+	// Promote this successful tunnel to first rank so it's one
+	// of the first candidates next time establish runs.
+	// Connecting to a TargetServerEntry does not change the
+	// ranking.
+	if controller.config.TargetServerEntry == "" {
+		PromoteServerEntry(tunnel.serverEntry.IpAddress)
 	}
 
-	return true
+	return len(controller.tunnels), true
 }
 
 // hasEstablishedOnce indicates if at least one active tunnel has
@@ -482,7 +667,7 @@ func (controller *Controller) terminateTunnel(tunnel *Tunnel) {
 			if controller.nextTunnel >= len(controller.tunnels) {
 				controller.nextTunnel = 0
 			}
-			activeTunnel.Close()
+			activeTunnel.Close(false)
 			NoticeTunnels(len(controller.tunnels))
 			break
 		}
@@ -503,7 +688,7 @@ func (controller *Controller) terminateAllTunnels() {
 		tunnel := activeTunnel
 		go func() {
 			defer closeWaitGroup.Done()
-			tunnel.Close()
+			tunnel.Close(false)
 		}()
 	}
 	closeWaitGroup.Wait()
@@ -590,8 +775,35 @@ func (controller *Controller) startEstablishing() {
 	controller.isEstablishing = true
 	controller.establishWaitGroup = new(sync.WaitGroup)
 	controller.stopEstablishingBroadcast = make(chan struct{})
-	controller.candidateServerEntries = make(chan *ServerEntry)
+	controller.candidateServerEntries = make(chan *candidateServerEntry)
 	controller.establishPendingConns.Reset()
+
+	// The server affinity mechanism attempts to favor the previously
+	// used server when reconnecting. This is beneficial for user
+	// applications which expect consistency in user IP address (for
+	// example, a web site which prompts for additional user
+	// authentication when the IP address changes).
+	//
+	// Only the very first server, as determined by
+	// datastore.PromoteServerEntry(), is the server affinity candidate.
+	// Concurrent connections attempts to many servers are launched
+	// without delay, in case the affinity server connection fails.
+	// While the affinity server connection is outstanding, when any
+	// other connection is established, there is a short grace period
+	// delay before delivering the established tunnel; this allows some
+	// time for the affinity server connection to succeed first.
+	// When the affinity server connection fails, any other established
+	// tunnel is registered without delay.
+	//
+	// Note: the establishTunnelWorker that receives the affinity
+	// candidate is solely resonsible for closing
+	// controller.serverAffinityDoneBroadcast.
+	//
+	// Note: if config.EgressRegion or config.TunnelProtocol has changed
+	// since the top server was promoted, the first server may not actually
+	// be the last connected server.
+	// TODO: should not favor the first server in this case
+	controller.serverAffinityDoneBroadcast = make(chan struct{})
 
 	for i := 0; i < controller.config.ConnectionWorkerPoolSize; i++ {
 		controller.establishWaitGroup.Add(1)
@@ -599,7 +811,8 @@ func (controller *Controller) startEstablishing() {
 	}
 
 	controller.establishWaitGroup.Add(1)
-	go controller.establishCandidateGenerator()
+	go controller.establishCandidateGenerator(
+		controller.getImpairedProtocols())
 }
 
 // stopEstablishing signals the establish goroutines to stop and waits
@@ -611,7 +824,7 @@ func (controller *Controller) stopEstablishing() {
 	}
 	NoticeInfo("stop establishing")
 	close(controller.stopEstablishingBroadcast)
-	// Note: on Windows, interruptibleTCPClose doesn't really interrupt socket connects
+	// Note: interruptibleTCPClose doesn't really interrupt socket connects
 	// and may leave goroutines running for a time after the Wait call.
 	controller.establishPendingConns.CloseAll()
 	// Note: establishCandidateGenerator closes controller.candidateServerEntries
@@ -622,12 +835,13 @@ func (controller *Controller) stopEstablishing() {
 	controller.establishWaitGroup = nil
 	controller.stopEstablishingBroadcast = nil
 	controller.candidateServerEntries = nil
+	controller.serverAffinityDoneBroadcast = nil
 }
 
 // establishCandidateGenerator populates the candidate queue with server entries
 // from the data store. Server entries are iterated in rank order, so that promoted
 // servers with higher rank are priority candidates.
-func (controller *Controller) establishCandidateGenerator() {
+func (controller *Controller) establishCandidateGenerator(impairedProtocols []string) {
 	defer controller.establishWaitGroup.Done()
 	defer close(controller.candidateServerEntries)
 
@@ -639,9 +853,24 @@ func (controller *Controller) establishCandidateGenerator() {
 	}
 	defer iterator.Close()
 
+	isServerAffinityCandidate := true
+
+	// TODO: reconcile server affinity scheme with multi-tunnel mode
+	if controller.config.TunnelPoolSize > 1 {
+		isServerAffinityCandidate = false
+		close(controller.serverAffinityDoneBroadcast)
+	}
+
 loop:
 	// Repeat until stopped
-	for {
+	for i := 0; ; i++ {
+
+		if !WaitForNetworkConnectivity(
+			controller.config.NetworkConnectivityChecker,
+			controller.stopEstablishingBroadcast,
+			controller.shutdownBroadcast) {
+			break loop
+		}
 
 		// Send each iterator server entry to the establish workers
 		startTime := time.Now()
@@ -657,18 +886,43 @@ loop:
 				break
 			}
 
+			// Disable impaired protocols. This is only done for the
+			// first iteration of the ESTABLISH_TUNNEL_WORK_TIME
+			// loop since (a) one iteration should be sufficient to
+			// evade the attack; (b) there's a good chance of false
+			// positives (such as short tunnel durations due to network
+			// hopping on a mobile device).
+			// Impaired protocols logic is not applied when
+			// config.TunnelProtocol is specified.
+			// The edited serverEntry is temporary copy which is not
+			// stored or reused.
+			if i == 0 && controller.config.TunnelProtocol == "" {
+				serverEntry.DisableImpairedProtocols(impairedProtocols)
+				if len(serverEntry.GetSupportedProtocols()) == 0 {
+					// Skip this server entry, as it has no supported
+					// protocols after disabling the impaired ones
+					// TODO: modify ServerEntryIterator to skip these?
+					continue
+				}
+			}
+
+			// Note: there must be only one server affinity candidate, as it
+			// closes the serverAffinityDoneBroadcast channel.
+			candidate := &candidateServerEntry{serverEntry, isServerAffinityCandidate}
+			isServerAffinityCandidate = false
+
 			// TODO: here we could generate multiple candidates from the
 			// server entry when there are many MeekFrontingAddresses.
 
 			select {
-			case controller.candidateServerEntries <- serverEntry:
+			case controller.candidateServerEntries <- candidate:
 			case <-controller.stopEstablishingBroadcast:
 				break loop
 			case <-controller.shutdownBroadcast:
 				break loop
 			}
 
-			if time.Now().After(startTime.Add(ESTABLISH_TUNNEL_WORK_TIME_SECONDS)) {
+			if time.Now().After(startTime.Add(ESTABLISH_TUNNEL_WORK_TIME)) {
 				// Start over, after a brief pause, with a new shuffle of the server
 				// entries, and potentially some newly fetched server entries.
 				break
@@ -715,7 +969,7 @@ loop:
 func (controller *Controller) establishTunnelWorker() {
 	defer controller.establishWaitGroup.Done()
 loop:
-	for serverEntry := range controller.candidateServerEntries {
+	for candidateServerEntry := range controller.candidateServerEntries {
 		// Note: don't receive from candidateServerEntries and stopEstablishingBroadcast
 		// in the same select, since we want to prioritize receiving the stop signal
 		if controller.isStopEstablishingBroadcast() {
@@ -723,30 +977,42 @@ loop:
 		}
 
 		// There may already be a tunnel to this candidate. If so, skip it.
-		if controller.isActiveTunnelServerEntry(serverEntry) {
+		if controller.isActiveTunnelServerEntry(candidateServerEntry.serverEntry) {
 			continue
-		}
-
-		if !WaitForNetworkConnectivity(
-			controller.config.NetworkConnectivityChecker,
-			controller.stopEstablishingBroadcast) {
-			break loop
 		}
 
 		tunnel, err := EstablishTunnel(
 			controller.config,
+			controller.untunneledDialConfig,
 			controller.sessionId,
 			controller.establishPendingConns,
-			serverEntry,
+			candidateServerEntry.serverEntry,
 			controller) // TunnelOwner
 		if err != nil {
+
+			// Unblock other candidates immediately when
+			// server affinity candidate fails.
+			if candidateServerEntry.isServerAffinityCandidate {
+				close(controller.serverAffinityDoneBroadcast)
+			}
+
 			// Before emitting error, check if establish interrupted, in which
 			// case the error is noise.
 			if controller.isStopEstablishingBroadcast() {
 				break loop
 			}
-			NoticeInfo("failed to connect to %s: %s", serverEntry.IpAddress, err)
+			NoticeInfo("failed to connect to %s: %s", candidateServerEntry.serverEntry.IpAddress, err)
 			continue
+		}
+
+		// Block for server affinity grace period before delivering.
+		if !candidateServerEntry.isServerAffinityCandidate {
+			timer := time.NewTimer(ESTABLISH_TUNNEL_SERVER_AFFINITY_GRACE_PERIOD)
+			select {
+			case <-timer.C:
+			case <-controller.serverAffinityDoneBroadcast:
+			case <-controller.stopEstablishingBroadcast:
+			}
 		}
 
 		// Deliver established tunnel.
@@ -757,6 +1023,12 @@ loop:
 		case controller.establishedTunnels <- tunnel:
 		default:
 			controller.discardTunnel(tunnel)
+		}
+
+		// Unblock other candidates only after delivering when
+		// server affinity candidate succeeds.
+		if candidateServerEntry.isServerAffinityCandidate {
+			close(controller.serverAffinityDoneBroadcast)
 		}
 	}
 	NoticeInfo("stopped establish worker")

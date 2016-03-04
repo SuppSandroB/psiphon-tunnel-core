@@ -46,6 +46,15 @@ func Contains(list []string, target string) bool {
 	return false
 }
 
+// FlipCoin is a helper function that randomly
+// returns true or false. If the underlying random
+// number generator fails, FlipCoin still returns
+// a result.
+func FlipCoin() bool {
+	randomInt, _ := MakeSecureRandomInt(2)
+	return randomInt == 1
+}
+
 // MakeSecureRandomInt is a helper function that wraps
 // MakeSecureRandomInt64.
 func MakeSecureRandomInt(max int) (int, error) {
@@ -181,4 +190,52 @@ func IsAddressInUseError(err error) bool {
 		}
 	}
 	return false
+}
+
+// SyncFileWriter wraps a file and exposes an io.Writer. At predefined
+// steps, the file is synced (flushed to disk) while writing.
+type SyncFileWriter struct {
+	file  *os.File
+	step  int
+	count int
+}
+
+// NewSyncFileWriter creates a SyncFileWriter.
+func NewSyncFileWriter(file *os.File) *SyncFileWriter {
+	return &SyncFileWriter{
+		file:  file,
+		step:  2 << 16,
+		count: 0}
+}
+
+// Write implements io.Writer with periodic file syncing.
+func (writer *SyncFileWriter) Write(p []byte) (n int, err error) {
+	n, err = writer.file.Write(p)
+	if err != nil {
+		return
+	}
+	writer.count += n
+	if writer.count >= writer.step {
+		err = writer.file.Sync()
+		writer.count = 0
+	}
+	return
+}
+
+// GetCurrentTimestamp returns the current time in UTC as
+// an RFC 3339 formatted string.
+func GetCurrentTimestamp() string {
+	return time.Now().UTC().Format(time.RFC3339)
+}
+
+// TruncateTimestampToHour truncates an RFC 3339 formatted string
+// to hour granularity. If the input is not a valid format, the
+// result is "".
+func TruncateTimestampToHour(timestamp string) string {
+	t, err := time.Parse(time.RFC3339, timestamp)
+	if err != nil {
+		NoticeAlert("failed to truncate timestamp: %s", err)
+		return ""
+	}
+	return t.Truncate(1 * time.Hour).Format(time.RFC3339)
 }
