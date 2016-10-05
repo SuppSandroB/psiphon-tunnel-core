@@ -27,13 +27,16 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/Psiphon-Inc/crypto/ssh"
+	"github.com/Psiphon-Inc/goarista/monotime"
 	regen "github.com/Psiphon-Inc/goregen"
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/transferstats"
-	"golang.org/x/crypto/ssh"
 )
 
 // Tunneler specifies the interface required by components that use a tunnel.
@@ -63,22 +66,40 @@ type TunnelOwner interface {
 // tunnel includes a network connection to the specified server
 // and an SSH session built on top of that transport.
 type Tunnel struct {
-	mutex                    *sync.Mutex
-	config                   *Config
-	untunneledDialConfig     *DialConfig
-	isDiscarded              bool
-	isClosed                 bool
-	serverEntry              *ServerEntry
-	serverContext            *ServerContext
-	protocol                 string
-	conn                     net.Conn
-	sshClient                *ssh.Client
-	operateWaitGroup         *sync.WaitGroup
-	shutdownOperateBroadcast chan struct{}
-	signalPortForwardFailure chan struct{}
-	totalPortForwardFailures int
-	startTime                time.Time
-	frontedMeekStats         *FrontedMeekStats
+	mutex                        *sync.Mutex
+	config                       *Config
+	untunneledDialConfig         *DialConfig
+	isDiscarded                  bool
+	isClosed                     bool
+	serverEntry                  *ServerEntry
+	serverContext                *ServerContext
+	protocol                     string
+	conn                         *common.ActivityMonitoredConn
+	sshClient                    *ssh.Client
+	operateWaitGroup             *sync.WaitGroup
+	shutdownOperateBroadcast     chan struct{}
+	signalPortForwardFailure     chan struct{}
+	totalPortForwardFailures     int
+	establishDuration            time.Duration
+	establishedTime              monotime.Time
+	dialStats                    *TunnelDialStats
+	newClientVerificationPayload chan string
+}
+
+// TunnelDialStats records additional dial config that is sent to the server for stats
+// recording. This data is used to analyze which configuration settings are successful
+// in various circumvention contexts, and includes meek dial params and upstream proxy
+// params.
+// For upstream proxy, only proxy type and custom header names are recorded; proxy
+// address and custom header values are considered PII.
+type TunnelDialStats struct {
+	UpstreamProxyType              string
+	UpstreamProxyCustomHeaderNames []string
+	MeekDialAddress                string
+	MeekResolvedIPAddress          string
+	MeekSNIServerName              string
+	MeekHostHeader                 string
+	MeekTransformedHostName        bool
 }
 
 // EstablishTunnel first makes a network transport connection to the
@@ -95,27 +116,30 @@ func EstablishTunnel(
 	config *Config,
 	untunneledDialConfig *DialConfig,
 	sessionId string,
-	pendingConns *Conns,
+	pendingConns *common.Conns,
 	serverEntry *ServerEntry,
+	adjustedEstablishStartTime monotime.Time,
 	tunnelOwner TunnelOwner) (tunnel *Tunnel, err error) {
 
 	selectedProtocol, err := selectProtocol(config, serverEntry)
 	if err != nil {
-		return nil, ContextError(err)
+		return nil, common.ContextError(err)
 	}
 
-	// Build transport layers and establish SSH connection
-	conn, sshClient, frontedMeekStats, err := dialSsh(
+	// Build transport layers and establish SSH connection. Note that
+	// dialConn and monitoredConn are the same network connection.
+	dialConn, monitoredConn, sshClient, dialStats, err := dialSsh(
 		config, pendingConns, serverEntry, selectedProtocol, sessionId)
 	if err != nil {
-		return nil, ContextError(err)
+		return nil, common.ContextError(err)
 	}
 
 	// Cleanup on error
 	defer func() {
 		if err != nil {
 			sshClient.Close()
-			conn.Close()
+			monitoredConn.Close()
+			pendingConns.Remove(dialConn)
 		}
 	}()
 
@@ -127,14 +151,17 @@ func EstablishTunnel(
 		isClosed:                 false,
 		serverEntry:              serverEntry,
 		protocol:                 selectedProtocol,
-		conn:                     conn,
+		conn:                     monitoredConn,
 		sshClient:                sshClient,
 		operateWaitGroup:         new(sync.WaitGroup),
 		shutdownOperateBroadcast: make(chan struct{}),
 		// A buffer allows at least one signal to be sent even when the receiver is
 		// not listening. Senders should not block.
 		signalPortForwardFailure: make(chan struct{}, 1),
-		frontedMeekStats:         frontedMeekStats,
+		dialStats:                dialStats,
+		// Buffer allows SetClientVerificationPayload to submit one new payload
+		// without blocking or dropping it.
+		newClientVerificationPayload: make(chan string, 1),
 	}
 
 	// Create a new Psiphon API server context for this tunnel. This includes
@@ -144,16 +171,26 @@ func EstablishTunnel(
 		NoticeInfo("starting server context for %s", tunnel.serverEntry.IpAddress)
 		tunnel.serverContext, err = NewServerContext(tunnel, sessionId)
 		if err != nil {
-			return nil, ContextError(
+			return nil, common.ContextError(
 				fmt.Errorf("error starting server context for %s: %s",
 					tunnel.serverEntry.IpAddress, err))
 		}
 	}
 
-	tunnel.startTime = time.Now()
+	// establishDuration is the elapsed time between the controller starting tunnel
+	// establishment and this tunnel being established. The reported value represents
+	// how long the user waited between starting the client and having a usable tunnel;
+	// or how long between the client detecting an unexpected tunnel disconnect and
+	// completing automatic reestablishment.
+	//
+	// This time period may include time spent unsuccessfully connecting to other
+	// servers. Time spent waiting for network connectivity is excluded.
+	tunnel.establishDuration = monotime.Since(adjustedEstablishStartTime)
+
+	tunnel.establishedTime = monotime.Now()
 
 	// Now that network operations are complete, cancel interruptibility
-	pendingConns.Remove(conn)
+	pendingConns.Remove(dialConn)
 
 	// Spawn the operateTunnel goroutine, which monitors the tunnel and handles periodic stats updates.
 	tunnel.operateWaitGroup.Add(1)
@@ -188,9 +225,16 @@ func (tunnel *Tunnel) Close(isDiscarded bool) {
 		tunnel.operateWaitGroup.Wait()
 		timer.Stop()
 		tunnel.sshClient.Close()
-		// tunnel.conn.Close() may get called twice, which is allowed.
+		// tunnel.conn.Close() may get called multiple times, which is allowed.
 		tunnel.conn.Close()
 	}
+}
+
+// IsClosed returns the tunnel's closed status.
+func (tunnel *Tunnel) IsClosed() bool {
+	tunnel.mutex.Lock()
+	defer tunnel.mutex.Unlock()
+	return tunnel.isClosed
 }
 
 // IsDiscarded returns the tunnel's discarded flag.
@@ -200,17 +244,38 @@ func (tunnel *Tunnel) IsDiscarded() bool {
 	return tunnel.isDiscarded
 }
 
+// SendAPIRequest sends an API request as an SSH request through the tunnel.
+// This function blocks awaiting a response. Only one request may be in-flight
+// at once; a concurrent SendAPIRequest will block until an active request
+// receives its response (or the SSH connection is terminated).
+func (tunnel *Tunnel) SendAPIRequest(
+	name string, requestPayload []byte) ([]byte, error) {
+
+	if tunnel.IsClosed() {
+		return nil, common.ContextError(errors.New("tunnel is closed"))
+	}
+
+	ok, responsePayload, err := tunnel.sshClient.Conn.SendRequest(
+		name, true, requestPayload)
+
+	if err != nil {
+		return nil, common.ContextError(err)
+	}
+
+	if !ok {
+		return nil, common.ContextError(errors.New("API request rejected"))
+	}
+
+	return responsePayload, nil
+}
+
 // Dial establishes a port forward connection through the tunnel
 // This Dial doesn't support split tunnel, so alwaysTunnel is not referenced
 func (tunnel *Tunnel) Dial(
 	remoteAddr string, alwaysTunnel bool, downstreamConn net.Conn) (conn net.Conn, err error) {
 
-	tunnel.mutex.Lock()
-	isClosed := tunnel.isClosed
-	tunnel.mutex.Unlock()
-
-	if isClosed {
-		return nil, errors.New("tunnel is closed")
+	if tunnel.IsClosed() {
+		return nil, common.ContextError(errors.New("tunnel is closed"))
 	}
 
 	type tunnelDialResult struct {
@@ -218,9 +283,11 @@ func (tunnel *Tunnel) Dial(
 		err                error
 	}
 	resultChannel := make(chan *tunnelDialResult, 2)
-	time.AfterFunc(TUNNEL_PORT_FORWARD_DIAL_TIMEOUT, func() {
-		resultChannel <- &tunnelDialResult{nil, errors.New("tunnel dial timeout")}
-	})
+	if *tunnel.config.TunnelPortForwardDialTimeoutSeconds > 0 {
+		time.AfterFunc(time.Duration(*tunnel.config.TunnelPortForwardDialTimeoutSeconds)*time.Second, func() {
+			resultChannel <- &tunnelDialResult{nil, errors.New("tunnel dial timeout")}
+		})
+	}
 	go func() {
 		sshPortForwardConn, err := tunnel.sshClient.Dial("tcp", remoteAddr)
 		resultChannel <- &tunnelDialResult{sshPortForwardConn, err}
@@ -233,7 +300,7 @@ func (tunnel *Tunnel) Dial(
 		case tunnel.signalPortForwardFailure <- *new(struct{}):
 		default:
 		}
-		return nil, ContextError(result.err)
+		return nil, common.ContextError(result.err)
 	}
 
 	conn = &TunneledConn{
@@ -258,6 +325,17 @@ func (tunnel *Tunnel) Dial(
 func (tunnel *Tunnel) SignalComponentFailure() {
 	NoticeAlert("tunnel received component failure signal")
 	tunnel.Close(false)
+}
+
+// SetClientVerificationPayload triggers a client verification request, for this
+// tunnel, with the specified verifiction payload. If the tunnel is not yet established,
+// the payload/request is enqueued. If a payload/request is already eneueued, the
+// new payload is dropped.
+func (tunnel *Tunnel) SetClientVerificationPayload(clientVerificationPayload string) {
+	select {
+	case tunnel.newClientVerificationPayload <- clientVerificationPayload:
+	default:
+	}
 }
 
 // TunneledConn implements net.Conn and wraps a port foward connection.
@@ -310,7 +388,7 @@ func selectProtocol(config *Config, serverEntry *ServerEntry) (selectedProtocol 
 	// for now, the code is simply assuming that MEEK capabilities imply OSSH capability.
 	if config.TunnelProtocol != "" {
 		if !serverEntry.SupportsProtocol(config.TunnelProtocol) {
-			return "", ContextError(fmt.Errorf("server does not have required capability"))
+			return "", common.ContextError(fmt.Errorf("server does not have required capability"))
 		}
 		selectedProtocol = config.TunnelProtocol
 	} else {
@@ -322,103 +400,177 @@ func selectProtocol(config *Config, serverEntry *ServerEntry) (selectedProtocol 
 
 		candidateProtocols := serverEntry.GetSupportedProtocols()
 		if len(candidateProtocols) == 0 {
-			return "", ContextError(fmt.Errorf("server does not have any supported capabilities"))
+			return "", common.ContextError(fmt.Errorf("server does not have any supported capabilities"))
 		}
 
-		index, err := MakeSecureRandomInt(len(candidateProtocols))
+		index, err := common.MakeSecureRandomInt(len(candidateProtocols))
 		if err != nil {
-			return "", ContextError(err)
+			return "", common.ContextError(err)
 		}
 		selectedProtocol = candidateProtocols[index]
 	}
 	return selectedProtocol, nil
 }
 
-// dialSsh is a helper that builds the transport layers and establishes the SSH connection.
-// When  FRONTED-MEEK-OSSH is selected, additional FrontedMeekStats are recorded and returned.
-func dialSsh(
+// selectFrontingParameters is a helper which selects/generates meek fronting
+// parameters where the server entry provides multiple options or patterns.
+func selectFrontingParameters(
+	serverEntry *ServerEntry) (frontingAddress, frontingHost string, err error) {
+
+	if len(serverEntry.MeekFrontingAddressesRegex) > 0 {
+
+		// Generate a front address based on the regex.
+
+		frontingAddress, err = regen.Generate(serverEntry.MeekFrontingAddressesRegex)
+		if err != nil {
+			return "", "", common.ContextError(err)
+		}
+	} else {
+
+		// Randomly select, for this connection attempt, one front address for
+		// fronting-capable servers.
+
+		if len(serverEntry.MeekFrontingAddresses) == 0 {
+			return "", "", common.ContextError(errors.New("MeekFrontingAddresses is empty"))
+		}
+		index, err := common.MakeSecureRandomInt(len(serverEntry.MeekFrontingAddresses))
+		if err != nil {
+			return "", "", common.ContextError(err)
+		}
+		frontingAddress = serverEntry.MeekFrontingAddresses[index]
+	}
+
+	if len(serverEntry.MeekFrontingHosts) > 0 {
+		index, err := common.MakeSecureRandomInt(len(serverEntry.MeekFrontingHosts))
+		if err != nil {
+			return "", "", common.ContextError(err)
+		}
+		frontingHost = serverEntry.MeekFrontingHosts[index]
+	} else {
+		// Backwards compatibility case
+		frontingHost = serverEntry.MeekFrontingHost
+	}
+
+	return
+}
+
+// initMeekConfig is a helper that creates a MeekConfig suitable for the
+// selected meek tunnel protocol.
+func initMeekConfig(
 	config *Config,
-	pendingConns *Conns,
 	serverEntry *ServerEntry,
 	selectedProtocol,
-	sessionId string) (
-	conn net.Conn, sshClient *ssh.Client, frontedMeekStats *FrontedMeekStats, err error) {
+	sessionId string) (*MeekConfig, error) {
+
+	// The meek protocol always uses OSSH
+	psiphonServerAddress := fmt.Sprintf("%s:%d", serverEntry.IpAddress, serverEntry.SshObfuscatedPort)
+
+	var dialAddress string
+	useHTTPS := false
+	var SNIServerName, hostHeader string
+	transformedHostName := false
+
+	switch selectedProtocol {
+	case common.TUNNEL_PROTOCOL_FRONTED_MEEK:
+		frontingAddress, frontingHost, err := selectFrontingParameters(serverEntry)
+		if err != nil {
+			return nil, common.ContextError(err)
+		}
+		dialAddress = fmt.Sprintf("%s:443", frontingAddress)
+		useHTTPS = true
+		if !serverEntry.MeekFrontingDisableSNI {
+			SNIServerName, transformedHostName =
+				config.HostNameTransformer.TransformHostName(frontingAddress)
+		}
+		hostHeader = frontingHost
+
+	case common.TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP:
+		frontingAddress, frontingHost, err := selectFrontingParameters(serverEntry)
+		if err != nil {
+			return nil, common.ContextError(err)
+		}
+		dialAddress = fmt.Sprintf("%s:80", frontingAddress)
+		hostHeader = frontingHost
+
+	case common.TUNNEL_PROTOCOL_UNFRONTED_MEEK:
+		dialAddress = fmt.Sprintf("%s:%d", serverEntry.IpAddress, serverEntry.MeekServerPort)
+		hostname := serverEntry.IpAddress
+		hostname, transformedHostName = config.HostNameTransformer.TransformHostName(hostname)
+		if serverEntry.MeekServerPort == 80 {
+			hostHeader = hostname
+		} else {
+			hostHeader = fmt.Sprintf("%s:%d", hostname, serverEntry.MeekServerPort)
+		}
+
+	case common.TUNNEL_PROTOCOL_UNFRONTED_MEEK_HTTPS:
+		dialAddress = fmt.Sprintf("%s:%d", serverEntry.IpAddress, serverEntry.MeekServerPort)
+		useHTTPS = true
+		SNIServerName, transformedHostName =
+			config.HostNameTransformer.TransformHostName(serverEntry.IpAddress)
+		if serverEntry.MeekServerPort == 443 {
+			hostHeader = serverEntry.IpAddress
+		} else {
+			hostHeader = fmt.Sprintf("%s:%d", serverEntry.IpAddress, serverEntry.MeekServerPort)
+		}
+
+	default:
+		return nil, common.ContextError(errors.New("unexpected selectedProtocol"))
+	}
+
+	// The unnderlying TLS will automatically disable SNI for IP address server name
+	// values; we have this explicit check here so we record the correct value for stats.
+	if net.ParseIP(SNIServerName) != nil {
+		SNIServerName = ""
+	}
+
+	return &MeekConfig{
+		DialAddress:                   dialAddress,
+		UseHTTPS:                      useHTTPS,
+		SNIServerName:                 SNIServerName,
+		HostHeader:                    hostHeader,
+		TransformedHostName:           transformedHostName,
+		PsiphonServerAddress:          psiphonServerAddress,
+		SessionID:                     sessionId,
+		MeekCookieEncryptionPublicKey: serverEntry.MeekCookieEncryptionPublicKey,
+		MeekObfuscatedKey:             serverEntry.MeekObfuscatedKey,
+	}, nil
+}
+
+// dialSsh is a helper that builds the transport layers and establishes the SSH connection.
+// When additional dial configuration is used, DialStats are recorded and returned.
+//
+// The net.Conn return value is the value to be removed from pendingConns; additional
+// layering (ThrottledConn, ActivityMonitoredConn) is applied, but this return value is the
+// base dial conn. The *ActivityMonitoredConn return value is the layered conn passed into
+// the ssh.Client.
+func dialSsh(
+	config *Config,
+	pendingConns *common.Conns,
+	serverEntry *ServerEntry,
+	selectedProtocol,
+	sessionId string) (net.Conn, *common.ActivityMonitoredConn, *ssh.Client, *TunnelDialStats, error) {
 
 	// The meek protocols tunnel obfuscated SSH. Obfuscated SSH is layered on top of SSH.
 	// So depending on which protocol is used, multiple layers are initialized.
-	port := 0
-	useMeek := false
-	useMeekHTTPS := false
-	useMeekSNI := false
-	useFronting := false
+
 	useObfuscatedSsh := false
+	var directTCPDialAddress string
+	var meekConfig *MeekConfig
+	var err error
+
 	switch selectedProtocol {
-	case TUNNEL_PROTOCOL_FRONTED_MEEK:
-		useMeek = true
-		useMeekHTTPS = true
-		useMeekSNI = !serverEntry.MeekFrontingDisableSNI
-		useFronting = true
+	case common.TUNNEL_PROTOCOL_OBFUSCATED_SSH:
 		useObfuscatedSsh = true
-	case TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP:
-		useMeek = true
-		useMeekHTTPS = false
-		useMeekSNI = false
-		useFronting = true
+		directTCPDialAddress = fmt.Sprintf("%s:%d", serverEntry.IpAddress, serverEntry.SshObfuscatedPort)
+
+	case common.TUNNEL_PROTOCOL_SSH:
+		directTCPDialAddress = fmt.Sprintf("%s:%d", serverEntry.IpAddress, serverEntry.SshPort)
+
+	default:
 		useObfuscatedSsh = true
-	case TUNNEL_PROTOCOL_UNFRONTED_MEEK:
-		useMeek = true
-		useMeekHTTPS = false
-		useMeekSNI = false
-		useObfuscatedSsh = true
-		port = serverEntry.SshObfuscatedPort
-	case TUNNEL_PROTOCOL_UNFRONTED_MEEK_HTTPS:
-		useMeek = true
-		useMeekHTTPS = true
-		useMeekSNI = false
-		useObfuscatedSsh = true
-		port = serverEntry.SshObfuscatedPort
-	case TUNNEL_PROTOCOL_OBFUSCATED_SSH:
-		useObfuscatedSsh = true
-		port = serverEntry.SshObfuscatedPort
-	case TUNNEL_PROTOCOL_SSH:
-		port = serverEntry.SshPort
-	}
-
-	frontingAddress := ""
-	frontingHost := ""
-	if useFronting {
-		if len(serverEntry.MeekFrontingAddressesRegex) > 0 {
-
-			// Generate a front address based on the regex.
-
-			frontingAddress, err = regen.Generate(serverEntry.MeekFrontingAddressesRegex)
-			if err != nil {
-				return nil, nil, nil, ContextError(err)
-			}
-		} else {
-
-			// Randomly select, for this connection attempt, one front address for
-			// fronting-capable servers.
-
-			if len(serverEntry.MeekFrontingAddresses) == 0 {
-				return nil, nil, nil, ContextError(errors.New("MeekFrontingAddresses is empty"))
-			}
-			index, err := MakeSecureRandomInt(len(serverEntry.MeekFrontingAddresses))
-			if err != nil {
-				return nil, nil, nil, ContextError(err)
-			}
-			frontingAddress = serverEntry.MeekFrontingAddresses[index]
-		}
-
-		if len(serverEntry.MeekFrontingHosts) > 0 {
-			index, err := MakeSecureRandomInt(len(serverEntry.MeekFrontingHosts))
-			if err != nil {
-				return nil, nil, nil, ContextError(err)
-			}
-			frontingHost = serverEntry.MeekFrontingHosts[index]
-		} else {
-			// Backwards compatibility case
-			frontingHost = serverEntry.MeekFrontingHost
+		meekConfig, err = initMeekConfig(config, serverEntry, selectedProtocol, sessionId)
+		if err != nil {
+			return nil, nil, nil, nil, common.ContextError(err)
 		}
 	}
 
@@ -426,7 +578,8 @@ func dialSsh(
 		serverEntry.IpAddress,
 		serverEntry.Region,
 		selectedProtocol,
-		frontingAddress)
+		directTCPDialAddress,
+		meekConfig)
 
 	// Use an asynchronous callback to record the resolved IP address when
 	// dialing a domain name. Note that DialMeek doesn't immediately
@@ -443,7 +596,8 @@ func dialSsh(
 	// Create the base transport: meek or direct connection
 	dialConfig := &DialConfig{
 		UpstreamProxyUrl:              config.UpstreamProxyUrl,
-		ConnectTimeout:                TUNNEL_CONNECT_TIMEOUT,
+		UpstreamProxyCustomHeaders:    config.UpstreamProxyCustomHeaders,
+		ConnectTimeout:                time.Duration(*config.TunnelConnectTimeoutSeconds) * time.Second,
 		PendingConns:                  pendingConns,
 		DeviceBinder:                  config.DeviceBinder,
 		DnsServerGetter:               config.DnsServerGetter,
@@ -452,46 +606,56 @@ func dialSsh(
 		DeviceRegion:                  config.DeviceRegion,
 		ResolvedIPCallback:            setResolvedIPAddress,
 	}
-	if useMeek {
-		conn, err = DialMeek(
-			serverEntry, sessionId, useMeekHTTPS, useMeekSNI, frontingAddress, frontingHost, dialConfig)
+	var dialConn net.Conn
+	if meekConfig != nil {
+		dialConn, err = DialMeek(meekConfig, dialConfig)
 		if err != nil {
-			return nil, nil, nil, ContextError(err)
+			return nil, nil, nil, nil, common.ContextError(err)
 		}
 	} else {
-		conn, err = DialTCP(fmt.Sprintf("%s:%d", serverEntry.IpAddress, port), dialConfig)
+		dialConn, err = DialTCP(directTCPDialAddress, dialConfig)
 		if err != nil {
-			return nil, nil, nil, ContextError(err)
+			return nil, nil, nil, nil, common.ContextError(err)
 		}
 	}
 
-	cleanupConn := conn
+	cleanupConn := dialConn
 	defer func() {
 		// Cleanup on error
-		if err != nil {
+		if cleanupConn != nil {
 			cleanupConn.Close()
+			pendingConns.Remove(cleanupConn)
 		}
 	}()
 
+	// Activity monitoring is used to measure tunnel duration
+	monitoredConn, err := common.NewActivityMonitoredConn(dialConn, 0, false, nil)
+	if err != nil {
+		return nil, nil, nil, nil, common.ContextError(err)
+	}
+
+	// Apply throttling (if configured)
+	throttledConn := common.NewThrottledConn(monitoredConn, config.RateLimits)
+
 	// Add obfuscated SSH layer
-	var sshConn net.Conn
-	sshConn = conn
+	var sshConn net.Conn = throttledConn
 	if useObfuscatedSsh {
-		sshConn, err = NewObfuscatedSshConn(conn, serverEntry.SshObfuscatedKey)
+		sshConn, err = NewObfuscatedSshConn(
+			OBFUSCATION_CONN_MODE_CLIENT, throttledConn, serverEntry.SshObfuscatedKey)
 		if err != nil {
-			return nil, nil, nil, ContextError(err)
+			return nil, nil, nil, nil, common.ContextError(err)
 		}
 	}
 
-	// Now establish the SSH session over the sshConn transport
+	// Now establish the SSH session over the conn transport
 	expectedPublicKey, err := base64.StdEncoding.DecodeString(serverEntry.SshHostKey)
 	if err != nil {
-		return nil, nil, nil, ContextError(err)
+		return nil, nil, nil, nil, common.ContextError(err)
 	}
 	sshCertChecker := &ssh.CertChecker{
 		HostKeyFallback: func(addr string, remote net.Addr, publicKey ssh.PublicKey) error {
 			if !bytes.Equal(expectedPublicKey, publicKey.Marshal()) {
-				return ContextError(errors.New("unexpected host public key"))
+				return common.ContextError(errors.New("unexpected host public key"))
 			}
 			return nil
 		},
@@ -502,7 +666,7 @@ func dialSsh(
 			SshPassword string `json:"SshPassword"`
 		}{sessionId, serverEntry.SshPassword})
 	if err != nil {
-		return nil, nil, nil, ContextError(err)
+		return nil, nil, nil, nil, common.ContextError(err)
 	}
 	sshClientConfig := &ssh.ClientConfig{
 		User: serverEntry.SshUsername,
@@ -528,12 +692,14 @@ func dialSsh(
 		err       error
 	}
 	resultChannel := make(chan *sshNewClientResult, 2)
-	time.AfterFunc(TUNNEL_CONNECT_TIMEOUT, func() {
-		resultChannel <- &sshNewClientResult{nil, errors.New("ssh dial timeout")}
-	})
+	if *config.TunnelConnectTimeoutSeconds > 0 {
+		time.AfterFunc(time.Duration(*config.TunnelConnectTimeoutSeconds)*time.Second, func() {
+			resultChannel <- &sshNewClientResult{nil, errors.New("ssh dial timeout")}
+		})
+	}
 
 	go func() {
-		// The folowing is adapted from ssh.Dial(), here using a custom conn
+		// The following is adapted from ssh.Dial(), here using a custom conn
 		// The sshAddress is passed through to host key verification callbacks; we don't use it.
 		sshAddress := ""
 		sshClientConn, sshChans, sshReqs, err := ssh.NewClientConn(sshConn, sshAddress, sshClientConfig)
@@ -546,23 +712,56 @@ func dialSsh(
 
 	result := <-resultChannel
 	if result.err != nil {
-		return nil, nil, nil, ContextError(result.err)
+		return nil, nil, nil, nil, common.ContextError(result.err)
 	}
 
-	if selectedProtocol == TUNNEL_PROTOCOL_FRONTED_MEEK ||
-		selectedProtocol == TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP {
+	var dialStats *TunnelDialStats
 
-		frontedMeekStats = &FrontedMeekStats{
-			frontingAddress:   frontingAddress,
-			resolvedIPAddress: resolvedIPAddress.Load().(string),
-			enabledSNI:        useMeekSNI,
-			frontingHost:      frontingHost,
+	if dialConfig.UpstreamProxyUrl != "" || meekConfig != nil {
+		dialStats = &TunnelDialStats{}
+
+		if dialConfig.UpstreamProxyUrl != "" {
+
+			// Note: UpstreamProxyUrl should have parsed correctly in the dial
+			proxyURL, err := url.Parse(dialConfig.UpstreamProxyUrl)
+			if err == nil {
+				dialStats.UpstreamProxyType = proxyURL.Scheme
+			}
+
+			dialStats.UpstreamProxyCustomHeaderNames = make([]string, 0)
+			for name, _ := range dialConfig.UpstreamProxyCustomHeaders {
+				dialStats.UpstreamProxyCustomHeaderNames = append(dialStats.UpstreamProxyCustomHeaderNames, name)
+			}
 		}
 
-		NoticeFrontedMeekStats(serverEntry.IpAddress, frontedMeekStats)
+		if meekConfig != nil {
+			dialStats.MeekDialAddress = meekConfig.DialAddress
+			dialStats.MeekResolvedIPAddress = resolvedIPAddress.Load().(string)
+			dialStats.MeekSNIServerName = meekConfig.SNIServerName
+			dialStats.MeekHostHeader = meekConfig.HostHeader
+			dialStats.MeekTransformedHostName = meekConfig.TransformedHostName
+		}
+
+		NoticeConnectedTunnelDialStats(serverEntry.IpAddress, dialStats)
 	}
 
-	return conn, result.sshClient, frontedMeekStats, nil
+	cleanupConn = nil
+
+	// Note: dialConn may be used to close the underlying network connection
+	// but should not be used to perform I/O as that would interfere with SSH
+	// (and also bypasses throttling).
+
+	return dialConn, monitoredConn, result.sshClient, dialStats, nil
+}
+
+func makeRandomPeriod(min, max time.Duration) time.Duration {
+	period, err := common.MakeRandomPeriod(min, max)
+	if err != nil {
+		NoticeAlert("MakeRandomPeriod failed: %s", err)
+		// Proceed without random period
+		period = max
+	}
+	return period
 }
 
 // operateTunnel monitors the health of the tunnel and performs
@@ -614,9 +813,9 @@ func dialSsh(
 func (tunnel *Tunnel) operateTunnel(tunnelOwner TunnelOwner) {
 	defer tunnel.operateWaitGroup.Done()
 
-	lastBytesReceivedTime := time.Now()
+	lastBytesReceivedTime := monotime.Now()
 
-	lastTotalBytesTransferedTime := time.Now()
+	lastTotalBytesTransferedTime := monotime.Now()
 	totalSent := int64(0)
 	totalReceived := int64(0)
 
@@ -627,7 +826,7 @@ func (tunnel *Tunnel) operateTunnel(tunnelOwner TunnelOwner) {
 	// from a range, to make the resulting traffic less fingerprintable,
 	// Note: not using Tickers since these are not fixed time periods.
 	nextStatusRequestPeriod := func() time.Duration {
-		return MakeRandomPeriod(
+		return makeRandomPeriod(
 			PSIPHON_API_STATUS_REQUEST_PERIOD_MIN,
 			PSIPHON_API_STATUS_REQUEST_PERIOD_MAX)
 	}
@@ -646,13 +845,13 @@ func (tunnel *Tunnel) operateTunnel(tunnelOwner TunnelOwner) {
 	unreported := CountUnreportedTunnelStats()
 	if unreported > 0 {
 		NoticeInfo("Unreported tunnel stats: %d", unreported)
-		statsTimer.Reset(MakeRandomPeriod(
+		statsTimer.Reset(makeRandomPeriod(
 			PSIPHON_API_STATUS_REQUEST_SHORT_PERIOD_MIN,
 			PSIPHON_API_STATUS_REQUEST_SHORT_PERIOD_MAX))
 	}
 
 	nextSshKeepAlivePeriod := func() time.Duration {
-		return MakeRandomPeriod(
+		return makeRandomPeriod(
 			TUNNEL_SSH_KEEP_ALIVE_PERIOD_MIN,
 			TUNNEL_SSH_KEEP_ALIVE_PERIOD_MAX)
 	}
@@ -694,6 +893,46 @@ func (tunnel *Tunnel) operateTunnel(tunnelOwner TunnelOwner) {
 		}
 	}()
 
+	requestsWaitGroup.Add(1)
+	signalStopClientVerificationRequests := make(chan struct{})
+	go func() {
+		defer requestsWaitGroup.Done()
+
+		clientVerificationRequestSuccess := true
+		clientVerificationPayload := ""
+		failCount := 0
+		for {
+			// TODO: use reflect.SelectCase?
+			if clientVerificationRequestSuccess == true {
+				failCount = 0
+				select {
+				case clientVerificationPayload = <-tunnel.newClientVerificationPayload:
+				case <-signalStopClientVerificationRequests:
+					return
+				}
+			} else {
+				// If sendClientVerification failed to send the payload we
+				// will retry after a delay. Will use a new payload instead
+				// if that arrives in the meantime.
+				// If failures count is more than PSIPHON_API_CLIENT_VERIFICATION_REQUEST_MAX_RETRIES
+				// stop retrying for this tunnel.
+				failCount += 1
+				if failCount > PSIPHON_API_CLIENT_VERIFICATION_REQUEST_MAX_RETRIES {
+					return
+				}
+				timeout := time.After(PSIPHON_API_CLIENT_VERIFICATION_REQUEST_RETRY_PERIOD)
+				select {
+				case <-timeout:
+				case clientVerificationPayload = <-tunnel.newClientVerificationPayload:
+				case <-signalStopClientVerificationRequests:
+					return
+				}
+			}
+
+			clientVerificationRequestSuccess = sendClientVerification(tunnel, clientVerificationPayload)
+		}
+	}()
+
 	shutdown := false
 	var err error
 	for !shutdown && err == nil {
@@ -703,15 +942,15 @@ func (tunnel *Tunnel) operateTunnel(tunnelOwner TunnelOwner) {
 				tunnel.serverEntry.IpAddress)
 
 			if received > 0 {
-				lastBytesReceivedTime = time.Now()
+				lastBytesReceivedTime = monotime.Now()
 			}
 
 			totalSent += sent
 			totalReceived += received
 
-			if lastTotalBytesTransferedTime.Add(TOTAL_BYTES_TRANSFERRED_NOTICE_PERIOD).Before(time.Now()) {
+			if lastTotalBytesTransferedTime.Add(TOTAL_BYTES_TRANSFERRED_NOTICE_PERIOD).Before(monotime.Now()) {
 				NoticeTotalBytesTransferred(tunnel.serverEntry.IpAddress, totalSent, totalReceived)
-				lastTotalBytesTransferedTime = time.Now()
+				lastTotalBytesTransferedTime = monotime.Now()
 			}
 
 			// Only emit the frequent BytesTransferred notice when tunnel is not idle.
@@ -727,9 +966,9 @@ func (tunnel *Tunnel) operateTunnel(tunnelOwner TunnelOwner) {
 			statsTimer.Reset(nextStatusRequestPeriod())
 
 		case <-sshKeepAliveTimer.C:
-			if lastBytesReceivedTime.Add(TUNNEL_SSH_KEEP_ALIVE_PERIODIC_INACTIVE_PERIOD).Before(time.Now()) {
+			if lastBytesReceivedTime.Add(TUNNEL_SSH_KEEP_ALIVE_PERIODIC_INACTIVE_PERIOD).Before(monotime.Now()) {
 				select {
-				case signalSshKeepAlive <- TUNNEL_SSH_KEEP_ALIVE_PERIODIC_TIMEOUT:
+				case signalSshKeepAlive <- time.Duration(*tunnel.config.TunnelSshKeepAlivePeriodicTimeoutSeconds) * time.Second:
 				default:
 				}
 			}
@@ -741,9 +980,9 @@ func (tunnel *Tunnel) operateTunnel(tunnelOwner TunnelOwner) {
 			NoticeInfo("port forward failures for %s: %d",
 				tunnel.serverEntry.IpAddress, tunnel.totalPortForwardFailures)
 
-			if lastBytesReceivedTime.Add(TUNNEL_SSH_KEEP_ALIVE_PROBE_INACTIVE_PERIOD).Before(time.Now()) {
+			if lastBytesReceivedTime.Add(TUNNEL_SSH_KEEP_ALIVE_PROBE_INACTIVE_PERIOD).Before(monotime.Now()) {
 				select {
-				case signalSshKeepAlive <- TUNNEL_SSH_KEEP_ALIVE_PROBE_TIMEOUT:
+				case signalSshKeepAlive <- time.Duration(*tunnel.config.TunnelSshKeepAliveProbeTimeoutSeconds) * time.Second:
 				default:
 				}
 			}
@@ -760,6 +999,7 @@ func (tunnel *Tunnel) operateTunnel(tunnelOwner TunnelOwner) {
 
 	close(signalSshKeepAlive)
 	close(signalStatusRequest)
+	close(signalStopClientVerificationRequests)
 	requestsWaitGroup.Wait()
 
 	// Capture bytes transferred since the last noticeBytesTransferredTicker tick
@@ -770,23 +1010,52 @@ func (tunnel *Tunnel) operateTunnel(tunnelOwner TunnelOwner) {
 	// Always emit a final NoticeTotalBytesTransferred
 	NoticeTotalBytesTransferred(tunnel.serverEntry.IpAddress, totalSent, totalReceived)
 
-	// The stats for this tunnel will be reported via the next successful
-	// status request.
-	// Note: Since client clocks are unreliable, we use the server's reported
-	// timestamp in the handshake response as the tunnel start time. This time
-	// will be slightly earlier than the actual tunnel activation time, as the
-	// client has to receive and parse the response and activate the tunnel.
-	if !tunnel.IsDiscarded() {
+	// Tunnel does not have a serverContext when DisableApi is set.
+	if tunnel.serverContext != nil && !tunnel.IsDiscarded() {
+
+		// The stats for this tunnel will be reported via the next successful
+		// status request.
+
+		// Since client clocks are unreliable, we report the server's timestamp from
+		// the handshake response as the absolute tunnel start time. This time
+		// will be slightly earlier than the actual tunnel activation time, as the
+		// client has to receive and parse the response and activate the tunnel.
+
+		tunnelStartTime := tunnel.serverContext.serverHandshakeTimestamp
+
+		// For the tunnel duration calculation, we use the local clock. The start time
+		// is tunnel.establishedTime as recorded when the tunnel was established. For the
+		// end time, we do not use the current time as we may now be long past the
+		// actual termination time of the tunnel. For example, the host or device may
+		// have resumed after a long sleep (it's not clear that the monotonic clock service
+		// used to measure elapsed time will or will not stop during device sleep). Instead,
+		// we use the last data received time as the estimated tunnel end time.
+		//
+		// One potential issue with using the last received time is receiving data
+		// after an extended sleep because the device sleep occured with data still in
+		// the OS socket read buffer. This is not expected to happen on Android, as the
+		// OS will wake a process when it has TCP data available to read. (For this reason,
+		// the actual long sleep issue is only with an idle tunnel; in this case the client
+		// is responsible for sending SSH keep alives but a device sleep will delay the
+		// golang SSH keep alive timer.)
+		//
+		// Idle tunnels will only read data when a SSH keep alive is sent. As a result,
+		// the last-received-time scheme can undercount tunnel durations by up to
+		// TUNNEL_SSH_KEEP_ALIVE_PERIOD_MAX for idle tunnels.
+
+		tunnelDuration := tunnel.conn.GetLastActivityMonotime().Sub(tunnel.establishedTime)
+
 		err := RecordTunnelStats(
 			tunnel.serverContext.sessionId,
 			tunnel.serverContext.tunnelNumber,
 			tunnel.serverEntry.IpAddress,
-			tunnel.serverContext.serverHandshakeTimestamp,
-			fmt.Sprintf("%d", time.Now().Sub(tunnel.startTime)),
+			fmt.Sprintf("%d", tunnel.establishDuration),
+			tunnelStartTime,
+			fmt.Sprintf("%d", tunnelDuration),
 			totalSent,
 			totalReceived)
 		if err != nil {
-			NoticeAlert("RecordTunnelStats failed: %s", ContextError(err))
+			NoticeAlert("RecordTunnelStats failed: %s", common.ContextError(err))
 		}
 	}
 
@@ -801,10 +1070,11 @@ func (tunnel *Tunnel) operateTunnel(tunnelOwner TunnelOwner) {
 	// everything must be wrapped up quickly. Also, we still have a working
 	// tunnel. So we first attempt a tunneled status request (with a short
 	// timeout) and then attempt, synchronously -- otherwise the Contoller's
-	// untunneledPendingConns.CloseAll() will immediately interrupt untunneled
-	// requests -- untunneled requests (also with short timeouts).
-	// Note that this depends on the order of untunneledPendingConns.CloseAll()
-	// coming after tunnel.Close(): see note in Controller.Run().
+	// runWaitGroup.Wait() will return while a request is still in progress
+	// -- untunneled requests (also with short timeouts). Note that in this
+	// case the untunneled request will opt out of untunneledPendingConns so
+	// that it's not inadvertently canceled by the Controller shutdown
+	// sequence (see doUntunneledStatusRequest).
 	//
 	// If the tunnel has failed, the Controller may continue working. We want
 	// to re-establish as soon as possible (so don't want to block on status
@@ -829,20 +1099,29 @@ func (tunnel *Tunnel) operateTunnel(tunnelOwner TunnelOwner) {
 
 // sendSshKeepAlive is a helper which sends a keepalive@openssh.com request
 // on the specified SSH connections and returns true of the request succeeds
-// within a specified timeout.
+// within a specified timeout. If the request fails, the associated conn is
+// closed, which will terminate the associated tunnel.
 func sendSshKeepAlive(
 	sshClient *ssh.Client, conn net.Conn, timeout time.Duration) error {
 
 	errChannel := make(chan error, 2)
-	time.AfterFunc(timeout, func() {
-		errChannel <- TimeoutError{}
-	})
+	if timeout > 0 {
+		time.AfterFunc(timeout, func() {
+			errChannel <- TimeoutError{}
+		})
+	}
 
 	go func() {
 		// Random padding to frustrate fingerprinting
-		_, _, err := sshClient.SendRequest(
-			"keepalive@openssh.com", true,
-			MakeSecureRandomPadding(0, TUNNEL_SSH_KEEP_ALIVE_PAYLOAD_MAX_BYTES))
+		randomPadding, err := common.MakeSecureRandomPadding(0, TUNNEL_SSH_KEEP_ALIVE_PAYLOAD_MAX_BYTES)
+		if err != nil {
+			NoticeAlert("MakeSecureRandomPadding failed: %s", err)
+			// Proceed without random padding
+			randomPadding = make([]byte, 0)
+		}
+		// Note: reading a reply is important for last-received-time tunnel
+		// duration calculation.
+		_, _, err = sshClient.SendRequest("keepalive@openssh.com", true, randomPadding)
 		errChannel <- err
 	}()
 
@@ -852,7 +1131,7 @@ func sendSshKeepAlive(
 		conn.Close()
 	}
 
-	return ContextError(err)
+	return common.ContextError(err)
 }
 
 // sendStats is a helper for sending session stats to the server.
@@ -891,8 +1170,30 @@ func sendUntunneledStats(tunnel *Tunnel, isShutdown bool) {
 		return
 	}
 
-	err := TryUntunneledStatusRequest(tunnel, isShutdown)
+	err := tunnel.serverContext.TryUntunneledStatusRequest(isShutdown)
 	if err != nil {
 		NoticeAlert("TryUntunneledStatusRequest failed for %s: %s", tunnel.serverEntry.IpAddress, err)
 	}
+}
+
+// sendClientVerification is a helper for sending a client verification request
+// to the server.
+func sendClientVerification(tunnel *Tunnel, clientVerificationPayload string) bool {
+
+	// Tunnel does not have a serverContext when DisableApi is set
+	if tunnel.serverContext == nil {
+		return true
+	}
+
+	// Skip when tunnel is discarded
+	if tunnel.IsDiscarded() {
+		return true
+	}
+
+	err := tunnel.serverContext.DoClientVerificationRequest(clientVerificationPayload, tunnel.serverEntry.IpAddress)
+	if err != nil {
+		NoticeAlert("DoClientVerificationRequest failed for %s: %s", tunnel.serverEntry.IpAddress, err)
+	}
+
+	return err == nil
 }

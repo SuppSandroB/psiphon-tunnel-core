@@ -29,6 +29,9 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/Psiphon-Inc/goarista/monotime"
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
 )
 
 // Controller is a tunnel lifecycle coordinator. It manages lists of servers to
@@ -47,24 +50,26 @@ type Controller struct {
 	tunnels                        []*Tunnel
 	nextTunnel                     int
 	startedConnectedReporter       bool
-	startedUpgradeDownloader       bool
 	isEstablishing                 bool
 	establishWaitGroup             *sync.WaitGroup
 	stopEstablishingBroadcast      chan struct{}
 	candidateServerEntries         chan *candidateServerEntry
-	establishPendingConns          *Conns
-	untunneledPendingConns         *Conns
+	establishPendingConns          *common.Conns
+	untunneledPendingConns         *common.Conns
 	untunneledDialConfig           *DialConfig
 	splitTunnelClassifier          *SplitTunnelClassifier
 	signalFetchRemoteServerList    chan struct{}
+	signalDownloadUpgrade          chan string
 	impairedProtocolClassification map[string]int
 	signalReportConnected          chan struct{}
 	serverAffinityDoneBroadcast    chan struct{}
+	newClientVerificationPayload   chan string
 }
 
 type candidateServerEntry struct {
-	serverEntry               *ServerEntry
-	isServerAffinityCandidate bool
+	serverEntry                *ServerEntry
+	isServerAffinityCandidate  bool
+	adjustedEstablishStartTime monotime.Time
 }
 
 // NewController initializes a new controller.
@@ -73,19 +78,28 @@ func NewController(config *Config) (controller *Controller, err error) {
 	// Needed by regen, at least
 	rand.Seed(int64(time.Now().Nanosecond()))
 
+	// Supply a default HostNameTransformer
+	if config.HostNameTransformer == nil {
+		config.HostNameTransformer = &IdentityHostNameTransformer{}
+	}
+
 	// Generate a session ID for the Psiphon server API. This session ID is
 	// used across all tunnels established by the controller.
 	sessionId, err := MakeSessionId()
 	if err != nil {
-		return nil, ContextError(err)
+		return nil, common.ContextError(err)
 	}
+	NoticeSessionId(sessionId)
 
 	// untunneledPendingConns may be used to interrupt the fetch remote server list
 	// request and other untunneled connection establishments. BindToDevice may be
 	// used to exclude these requests and connection from VPN routing.
-	untunneledPendingConns := new(Conns)
+	// TODO: fetch remote server list and untunneled upgrade download should remove
+	// their completed conns from untunneledPendingConns.
+	untunneledPendingConns := new(common.Conns)
 	untunneledDialConfig := &DialConfig{
 		UpstreamProxyUrl:              config.UpstreamProxyUrl,
+		UpstreamProxyCustomHeaders:    config.UpstreamProxyCustomHeaders,
 		PendingConns:                  untunneledPendingConns,
 		DeviceBinder:                  config.DeviceBinder,
 		DnsServerGetter:               config.DnsServerGetter,
@@ -99,7 +113,7 @@ func NewController(config *Config) (controller *Controller, err error) {
 		sessionId: sessionId,
 		// componentFailureSignal receives a signal from a component (including socks and
 		// http local proxies) if they unexpectedly fail. Senders should not block.
-		// A buffer allows at least one stop signal to be sent before there is a receiver.
+		// Buffer allows at least one stop signal to be sent before there is a receiver.
 		componentFailureSignal: make(chan struct{}, 1),
 		shutdownBroadcast:      make(chan struct{}),
 		runWaitGroup:           new(sync.WaitGroup),
@@ -110,9 +124,8 @@ func NewController(config *Config) (controller *Controller, err error) {
 		tunnels:                        make([]*Tunnel, 0),
 		establishedOnce:                false,
 		startedConnectedReporter:       false,
-		startedUpgradeDownloader:       false,
 		isEstablishing:                 false,
-		establishPendingConns:          new(Conns),
+		establishPendingConns:          new(common.Conns),
 		untunneledPendingConns:         untunneledPendingConns,
 		untunneledDialConfig:           untunneledDialConfig,
 		impairedProtocolClassification: make(map[string]int),
@@ -120,7 +133,11 @@ func NewController(config *Config) (controller *Controller, err error) {
 		// starting? Trade-off is potential back-to-back fetch remotes. As-is,
 		// establish will eventually signal another fetch remote.
 		signalFetchRemoteServerList: make(chan struct{}),
+		signalDownloadUpgrade:       make(chan string),
 		signalReportConnected:       make(chan struct{}),
+		// Buffer allows SetClientVerificationPayloadForActiveTunnels to submit one
+		// new payload without blocking or dropping it.
+		newClientVerificationPayload: make(chan string, 1),
 	}
 
 	controller.splitTunnelClassifier = NewSplitTunnelClassifier(config, controller)
@@ -168,6 +185,13 @@ func (controller *Controller) Run(shutdownBroadcast <-chan struct{}) {
 		go controller.remoteServerListFetcher()
 	}
 
+	if controller.config.UpgradeDownloadUrl != "" &&
+		controller.config.UpgradeDownloadFilename != "" {
+
+		controller.runWaitGroup.Add(1)
+		go controller.upgradeDownloader()
+	}
+
 	/// Note: the connected reporter isn't started until a tunnel is
 	// established
 
@@ -189,23 +213,33 @@ func (controller *Controller) Run(shutdownBroadcast <-chan struct{}) {
 	}
 
 	close(controller.shutdownBroadcast)
-	controller.establishPendingConns.CloseAll()
-	controller.runWaitGroup.Wait()
 
-	// Stops untunneled connections, including fetch remote server list,
-	// split tunnel port forwards and also untunneled final stats requests.
-	// Note: there's a circular dependency with runWaitGroup.Wait() and
-	// untunneledPendingConns.CloseAll(): runWaitGroup depends on tunnels
-	// stopping which depends, in orderly shutdown, on final status requests
-	// completing. So this pending conns cancel comes too late to interrupt
-	// final status requests in the orderly shutdown case -- which is desired
-	// since we give those a short timeout and would prefer to not interrupt
-	// them.
+	// Interrupts and stops establish workers blocking on
+	// tunnel establishment network operations.
+	controller.establishPendingConns.CloseAll()
+
+	// Interrupts and stops workers blocking on untunneled
+	// network operations. This includes fetch remote server
+	// list and untunneled uprade download.
+	// Note: this doesn't interrupt the final, untunneled status
+	// requests started in operateTunnel after shutdownBroadcast.
+	// This is by design -- we want to give these requests a short
+	// timer period to succeed and deliver stats. These particular
+	// requests opt out of untunneledPendingConns and use the
+	// PSIPHON_API_SHUTDOWN_SERVER_TIMEOUT timeout (see
+	// doUntunneledStatusRequest).
 	controller.untunneledPendingConns.CloseAll()
+
+	// Now with all workers signaled to stop and with all
+	// blocking network operations interrupted, wait for
+	// all workers to terminate.
+	controller.runWaitGroup.Wait()
 
 	controller.splitTunnelClassifier.Shutdown()
 
 	NoticeInfo("exiting controller")
+
+	NoticeExiting()
 }
 
 // SignalComponentFailure notifies the controller that an associated component has failed.
@@ -217,13 +251,45 @@ func (controller *Controller) SignalComponentFailure() {
 	}
 }
 
+// SetClientVerificationPayloadForActiveTunnels sets the client verification
+// payload that is to be sent in client verification requests to all established
+// tunnels.
+//
+// Client verification is used to verify that the client is a
+// valid Psiphon client, which will determine how the server treats
+// the client traffic. The proof-of-validity is platform-specific
+// and the payload is opaque to this function but assumed to be JSON.
+//
+// Since, in some cases, verification payload cannot be determined until
+// after tunnel-core starts, the payload cannot be simply specified in
+// the Config.
+//
+// SetClientVerificationPayloadForActiveTunnels will not block enqueuing a new verification
+// payload. One new payload can be enqueued, after which additional payloads
+// will be dropped if a payload is still enqueued.
+func (controller *Controller) SetClientVerificationPayloadForActiveTunnels(clientVerificationPayload string) {
+	select {
+	case controller.newClientVerificationPayload <- clientVerificationPayload:
+	default:
+	}
+}
+
 // remoteServerListFetcher fetches an out-of-band list of server entries
 // for more tunnel candidates. It fetches when signalled, with retries
 // on failure.
 func (controller *Controller) remoteServerListFetcher() {
 	defer controller.runWaitGroup.Done()
 
-	var lastFetchTime time.Time
+	if controller.config.RemoteServerListUrl == "" {
+		NoticeAlert("remote server list URL is blank")
+		return
+	}
+	if controller.config.RemoteServerListSignaturePublicKey == "" {
+		NoticeAlert("remote server list signature public key blank")
+		return
+	}
+
+	var lastFetchTime monotime.Time
 
 fetcherLoop:
 	for {
@@ -236,7 +302,8 @@ fetcherLoop:
 
 		// Skip fetch entirely (i.e., send no request at all, even when ETag would save
 		// on response size) when a recent fetch was successful
-		if time.Now().Before(lastFetchTime.Add(FETCH_REMOTE_SERVER_LIST_STALE_PERIOD)) {
+		if lastFetchTime != 0 &&
+			lastFetchTime.Add(FETCH_REMOTE_SERVER_LIST_STALE_PERIOD).After(monotime.Now()) {
 			continue
 		}
 
@@ -250,17 +317,24 @@ fetcherLoop:
 				break fetcherLoop
 			}
 
+			// Pick any active tunnel and make the next fetch attempt. If there's
+			// no active tunnel, the untunneledDialConfig will be used.
+			tunnel := controller.getNextActiveTunnel()
+
 			err := FetchRemoteServerList(
-				controller.config, controller.untunneledDialConfig)
+				controller.config,
+				tunnel,
+				controller.untunneledDialConfig)
 
 			if err == nil {
-				lastFetchTime = time.Now()
+				lastFetchTime = monotime.Now()
 				break retryLoop
 			}
 
 			NoticeAlert("failed to fetch remote server list: %s", err)
 
-			timeout := time.After(FETCH_REMOTE_SERVER_LIST_RETRY_PERIOD)
+			timeout := time.After(
+				time.Duration(*controller.config.FetchRemoteServerListRetryPeriodSeconds) * time.Second)
 			select {
 			case <-timeout:
 			case <-controller.shutdownBroadcast:
@@ -365,63 +439,80 @@ func (controller *Controller) startOrSignalConnectedReporter() {
 // download. DownloadUpgrade() is resumable, so each attempt has potential for
 // getting closer to completion, even in conditions where the download or
 // tunnel is repeatedly interrupted.
-// Once the download is complete, the downloader exits and is not run again:
+// An upgrade download is triggered by either a handshake response indicating
+// that a new version is available; or after failing to connect, in which case
+// it's useful to check, out-of-band, for an upgrade with new circumvention
+// capabilities.
+// Once the download operation completes successfully, the downloader exits
+// and is not run again: either there is not a newer version, or the upgrade
+// has been downloaded and is ready to be applied.
 // We're assuming that the upgrade will be applied and the entire system
 // restarted before another upgrade is to be downloaded.
-func (controller *Controller) upgradeDownloader(clientUpgradeVersion string) {
+//
+// TODO: refactor upgrade downloader and remote server list fetcher to use
+// common code (including the resumable download routines).
+//
+func (controller *Controller) upgradeDownloader() {
 	defer controller.runWaitGroup.Done()
 
-loop:
+	var lastDownloadTime monotime.Time
+
+downloadLoop:
 	for {
-		// Pick any active tunnel and make the next download attempt. No error
-		// is logged if there's no active tunnel, as that's not an unexpected condition.
-		tunnel := controller.getNextActiveTunnel()
-		if tunnel != nil {
-			err := DownloadUpgrade(controller.config, clientUpgradeVersion, tunnel)
-			if err == nil {
-				break loop
-			}
-			NoticeAlert("upgrade download failed: %s", err)
+		// Wait for a signal before downloading
+		var handshakeVersion string
+		select {
+		case handshakeVersion = <-controller.signalDownloadUpgrade:
+		case <-controller.shutdownBroadcast:
+			break downloadLoop
 		}
 
-		timeout := time.After(DOWNLOAD_UPGRADE_RETRY_PAUSE_PERIOD)
-		select {
-		case <-timeout:
-			// Make another download attempt
-		case <-controller.shutdownBroadcast:
-			break loop
+		// Unless handshake is explicitly advertizing a new version, skip
+		// checking entirely when a recent download was successful.
+		if handshakeVersion == "" &&
+			lastDownloadTime != 0 &&
+			lastDownloadTime.Add(DOWNLOAD_UPGRADE_STALE_PERIOD).After(monotime.Now()) {
+			continue
+		}
+
+	retryLoop:
+		for {
+			// Don't attempt to download while there is no network connectivity,
+			// to avoid alert notice noise.
+			if !WaitForNetworkConnectivity(
+				controller.config.NetworkConnectivityChecker,
+				controller.shutdownBroadcast) {
+				break downloadLoop
+			}
+
+			// Pick any active tunnel and make the next download attempt. If there's
+			// no active tunnel, the untunneledDialConfig will be used.
+			tunnel := controller.getNextActiveTunnel()
+
+			err := DownloadUpgrade(
+				controller.config,
+				handshakeVersion,
+				tunnel,
+				controller.untunneledDialConfig)
+
+			if err == nil {
+				lastDownloadTime = monotime.Now()
+				break retryLoop
+			}
+
+			NoticeAlert("failed to download upgrade: %s", err)
+
+			timeout := time.After(
+				time.Duration(*controller.config.DownloadUpgradeRetryPeriodSeconds) * time.Second)
+			select {
+			case <-timeout:
+			case <-controller.shutdownBroadcast:
+				break downloadLoop
+			}
 		}
 	}
 
 	NoticeInfo("exiting upgrade downloader")
-}
-
-func (controller *Controller) startClientUpgradeDownloader(
-	serverContext *ServerContext) {
-
-	// serverContext is nil when DisableApi is set
-	if controller.config.DisableApi {
-		return
-	}
-
-	if controller.config.UpgradeDownloadUrl == "" ||
-		controller.config.UpgradeDownloadFilename == "" {
-		// No upgrade is desired
-		return
-	}
-
-	if serverContext.clientUpgradeVersion == "" {
-		// No upgrade is offered
-		return
-	}
-
-	// Start the client upgrade downloaded after the first tunnel is established.
-	// Concurrency note: only the runTunnels goroutine may access startClientUpgradeDownloader.
-	if !controller.startedUpgradeDownloader {
-		controller.startedUpgradeDownloader = true
-		controller.runWaitGroup.Add(1)
-		go controller.upgradeDownloader(serverContext.clientUpgradeVersion)
-	}
 }
 
 // runTunnels is the controller tunnel management main loop. It starts and stops
@@ -440,6 +531,8 @@ func (controller *Controller) startClientUpgradeDownloader(
 // restarted to fill the pool.
 func (controller *Controller) runTunnels() {
 	defer controller.runWaitGroup.Done()
+
+	var clientVerificationPayload string
 
 	// Start running
 
@@ -472,43 +565,76 @@ loop:
 				controller.startEstablishing()
 			}
 
-		// !TODO! design issue: might not be enough server entries with region/caps to ever fill tunnel slots
-		// solution(?) target MIN(CountServerEntries(region, protocol), TunnelPoolSize)
 		case establishedTunnel := <-controller.establishedTunnels:
-			tunnelCount, registered := controller.registerTunnel(establishedTunnel)
-			if registered {
-				NoticeActiveTunnel(establishedTunnel.serverEntry.IpAddress, establishedTunnel.protocol)
 
-				if tunnelCount == 1 {
+			if controller.isImpairedProtocol(establishedTunnel.protocol) {
 
-					// The split tunnel classifier is started once the first tunnel is
-					// established. This first tunnel is passed in to be used to make
-					// the routes data request.
-					// A long-running controller may run while the host device is present
-					// in different regions. In this case, we want the split tunnel logic
-					// to switch to routes for new regions and not classify traffic based
-					// on routes installed for older regions.
-					// We assume that when regions change, the host network will also
-					// change, and so all tunnels will fail and be re-established. Under
-					// that assumption, the classifier will be re-Start()-ed here when
-					// the region has changed.
-					controller.splitTunnelClassifier.Start(establishedTunnel)
+				NoticeAlert("established tunnel with impaired protocol: %s", establishedTunnel.protocol)
 
-					// Signal a connected request on each 1st tunnel establishment. For
-					// multi-tunnels, the session is connected as long as at least one
-					// tunnel is established.
-					controller.startOrSignalConnectedReporter()
-
-					controller.startClientUpgradeDownloader(
-						establishedTunnel.serverContext)
-				}
-
-			} else {
+				// Protocol was classified as impaired while this tunnel
+				// established, so discard.
 				controller.discardTunnel(establishedTunnel)
+
+				// Reset establish generator to stop producing tunnels
+				// with impaired protocols.
+				if controller.isEstablishing {
+					controller.stopEstablishing()
+					controller.startEstablishing()
+				}
+				break
 			}
+
+			tunnelCount, registered := controller.registerTunnel(establishedTunnel)
+			if !registered {
+				// Already fully established, so discard.
+				controller.discardTunnel(establishedTunnel)
+				break
+			}
+
+			NoticeActiveTunnel(establishedTunnel.serverEntry.IpAddress, establishedTunnel.protocol)
+
+			if tunnelCount == 1 {
+
+				// The split tunnel classifier is started once the first tunnel is
+				// established. This first tunnel is passed in to be used to make
+				// the routes data request.
+				// A long-running controller may run while the host device is present
+				// in different regions. In this case, we want the split tunnel logic
+				// to switch to routes for new regions and not classify traffic based
+				// on routes installed for older regions.
+				// We assume that when regions change, the host network will also
+				// change, and so all tunnels will fail and be re-established. Under
+				// that assumption, the classifier will be re-Start()-ed here when
+				// the region has changed.
+				controller.splitTunnelClassifier.Start(establishedTunnel)
+
+				// Signal a connected request on each 1st tunnel establishment. For
+				// multi-tunnels, the session is connected as long as at least one
+				// tunnel is established.
+				controller.startOrSignalConnectedReporter()
+
+				// If the handshake indicated that a new client version is available,
+				// trigger an upgrade download.
+				// Note: serverContext is nil when DisableApi is set
+				if establishedTunnel.serverContext != nil &&
+					establishedTunnel.serverContext.clientUpgradeVersion != "" {
+
+					handshakeVersion := establishedTunnel.serverContext.clientUpgradeVersion
+					select {
+					case controller.signalDownloadUpgrade <- handshakeVersion:
+					default:
+					}
+				}
+			}
+
+			// TODO: design issue -- might not be enough server entries with region/caps to ever fill tunnel slots;
+			// possible solution is establish target MIN(CountServerEntries(region, protocol), TunnelPoolSize)
 			if controller.isFullyEstablished() {
 				controller.stopEstablishing()
 			}
+
+		case clientVerificationPayload = <-controller.newClientVerificationPayload:
+			controller.setClientVerificationPayloadForActiveTunnels(clientVerificationPayload)
 
 		case <-controller.shutdownBroadcast:
 			break loop
@@ -546,12 +672,12 @@ loop:
 //
 // Concurrency note: only the runTunnels() goroutine may call classifyImpairedProtocol
 func (controller *Controller) classifyImpairedProtocol(failedTunnel *Tunnel) {
-	if failedTunnel.startTime.Add(IMPAIRED_PROTOCOL_CLASSIFICATION_DURATION).After(time.Now()) {
+	if failedTunnel.establishedTime.Add(IMPAIRED_PROTOCOL_CLASSIFICATION_DURATION).After(monotime.Now()) {
 		controller.impairedProtocolClassification[failedTunnel.protocol] += 1
 	} else {
 		controller.impairedProtocolClassification[failedTunnel.protocol] = 0
 	}
-	if len(controller.getImpairedProtocols()) == len(SupportedTunnelProtocols) {
+	if len(controller.getImpairedProtocols()) == len(common.SupportedTunnelProtocols) {
 		// Reset classification if all protocols are classified as impaired as
 		// the network situation (or attack) may not be protocol-specific.
 		// TODO: compare against count of distinct supported protocols for
@@ -565,9 +691,7 @@ func (controller *Controller) classifyImpairedProtocol(failedTunnel *Tunnel) {
 //
 // Concurrency note: only the runTunnels() goroutine may call getImpairedProtocols
 func (controller *Controller) getImpairedProtocols() []string {
-	if len(controller.impairedProtocolClassification) > 0 {
-		NoticeInfo("impaired protocols: %+v", controller.impairedProtocolClassification)
-	}
+	NoticeImpairedProtocolClassification(controller.impairedProtocolClassification)
 	impairedProtocols := make([]string, 0)
 	for protocol, count := range controller.impairedProtocolClassification {
 		if count >= IMPAIRED_PROTOCOL_CLASSIFICATION_THRESHOLD {
@@ -575,6 +699,14 @@ func (controller *Controller) getImpairedProtocols() []string {
 		}
 	}
 	return impairedProtocols
+}
+
+// isImpairedProtocol checks if the specified protocol is classified as impaired.
+//
+// Concurrency note: only the runTunnels() goroutine may call isImpairedProtocol
+func (controller *Controller) isImpairedProtocol(protocol string) bool {
+	count, ok := controller.impairedProtocolClassification[protocol]
+	return ok && count >= IMPAIRED_PROTOCOL_CLASSIFICATION_THRESHOLD
 }
 
 // SignalTunnelFailure implements the TunnelOwner interface. This function
@@ -724,6 +856,19 @@ func (controller *Controller) isActiveTunnelServerEntry(serverEntry *ServerEntry
 	return false
 }
 
+// setClientVerificationPayloadForActiveTunnels triggers the client verification
+// request for all active tunnels.
+func (controller *Controller) setClientVerificationPayloadForActiveTunnels(
+	clientVerificationPayload string) {
+
+	controller.tunnelMutex.Lock()
+	defer controller.tunnelMutex.Unlock()
+
+	for _, activeTunnel := range controller.tunnels {
+		activeTunnel.SetClientVerificationPayload(clientVerificationPayload)
+	}
+}
+
 // Dial selects an active tunnel and establishes a port forward
 // connection through the selected tunnel. Failure to connect is considered
 // a port foward failure, for the purpose of monitoring tunnel health.
@@ -732,7 +877,7 @@ func (controller *Controller) Dial(
 
 	tunnel := controller.getNextActiveTunnel()
 	if tunnel == nil {
-		return nil, ContextError(errors.New("no active tunnels"))
+		return nil, common.ContextError(errors.New("no active tunnels"))
 	}
 
 	// Perform split tunnel classification when feature is enabled, and if the remote
@@ -741,7 +886,7 @@ func (controller *Controller) Dial(
 
 		host, _, err := net.SplitHostPort(remoteAddr)
 		if err != nil {
-			return nil, ContextError(err)
+			return nil, common.ContextError(err)
 		}
 
 		// Note: a possible optimization, when split tunnel is active and IsUntunneled performs
@@ -751,14 +896,14 @@ func (controller *Controller) Dial(
 		// relative to the outbound network.
 
 		if controller.splitTunnelClassifier.IsUntunneled(host) {
-			// !TODO! track downstreamConn and close it when the DialTCP conn closes, as with tunnel.Dial conns?
+			// TODO: track downstreamConn and close it when the DialTCP conn closes, as with tunnel.Dial conns?
 			return DialTCP(remoteAddr, controller.untunneledDialConfig)
 		}
 	}
 
 	tunneledConn, err := tunnel.Dial(remoteAddr, alwaysTunnel, downstreamConn)
 	if err != nil {
-		return nil, ContextError(err)
+		return nil, common.ContextError(err)
 	}
 
 	return tunneledConn, nil
@@ -772,6 +917,7 @@ func (controller *Controller) startEstablishing() {
 		return
 	}
 	NoticeInfo("start establishing")
+
 	controller.isEstablishing = true
 	controller.establishWaitGroup = new(sync.WaitGroup)
 	controller.stopEstablishingBroadcast = make(chan struct{})
@@ -845,6 +991,15 @@ func (controller *Controller) establishCandidateGenerator(impairedProtocols []st
 	defer controller.establishWaitGroup.Done()
 	defer close(controller.candidateServerEntries)
 
+	// establishStartTime is used to calculate and report the
+	// client's tunnel establishment duration.
+	//
+	// networkWaitDuration is the elapsed time spent waiting
+	// for network connectivity. This duration will be excluded
+	// from reported tunnel establishment duration.
+	establishStartTime := monotime.Now()
+	var networkWaitDuration time.Duration
+
 	iterator, err := NewServerEntryIterator(controller.config)
 	if err != nil {
 		NoticeAlert("failed to iterate over candidates: %s", err)
@@ -865,6 +1020,8 @@ loop:
 	// Repeat until stopped
 	for i := 0; ; i++ {
 
+		networkWaitStartTime := monotime.Now()
+
 		if !WaitForNetworkConnectivity(
 			controller.config.NetworkConnectivityChecker,
 			controller.stopEstablishingBroadcast,
@@ -872,8 +1029,10 @@ loop:
 			break loop
 		}
 
+		networkWaitDuration += monotime.Since(networkWaitStartTime)
+
 		// Send each iterator server entry to the establish workers
-		startTime := time.Now()
+		startTime := monotime.Now()
 		for {
 			serverEntry, err := iterator.Next()
 			if err != nil {
@@ -884,6 +1043,11 @@ loop:
 			if serverEntry == nil {
 				// Completed this iteration
 				break
+			}
+
+			if controller.config.TargetApiProtocol == common.PSIPHON_SSH_API_PROTOCOL &&
+				!serverEntry.SupportsSSHAPIRequests() {
+				continue
 			}
 
 			// Disable impaired protocols. This is only done for the
@@ -906,9 +1070,17 @@ loop:
 				}
 			}
 
+			// adjustedEstablishStartTime is establishStartTime shifted
+			// to exclude time spent waiting for network connectivity.
+
+			candidate := &candidateServerEntry{
+				serverEntry:                serverEntry,
+				isServerAffinityCandidate:  isServerAffinityCandidate,
+				adjustedEstablishStartTime: establishStartTime.Add(networkWaitDuration),
+			}
+
 			// Note: there must be only one server affinity candidate, as it
 			// closes the serverAffinityDoneBroadcast channel.
-			candidate := &candidateServerEntry{serverEntry, isServerAffinityCandidate}
 			isServerAffinityCandidate = false
 
 			// TODO: here we could generate multiple candidates from the
@@ -922,7 +1094,7 @@ loop:
 				break loop
 			}
 
-			if time.Now().After(startTime.Add(ESTABLISH_TUNNEL_WORK_TIME)) {
+			if startTime.Add(ESTABLISH_TUNNEL_WORK_TIME).Before(monotime.Now()) {
 				// Start over, after a brief pause, with a new shuffle of the server
 				// entries, and potentially some newly fetched server entries.
 				break
@@ -943,12 +1115,21 @@ loop:
 		default:
 		}
 
+		// Trigger an out-of-band upgrade availability check and download.
+		// Since we may have failed to connect, we may benefit from upgrading
+		// to a new client version with new circumvention capabilities.
+		select {
+		case controller.signalDownloadUpgrade <- "":
+		default:
+		}
+
 		// After a complete iteration of candidate servers, pause before iterating again.
 		// This helps avoid some busy wait loop conditions, and also allows some time for
 		// network conditions to change. Also allows for fetch remote to complete,
 		// in typical conditions (it isn't strictly necessary to wait for this, there will
 		// be more rounds if required).
-		timeout := time.After(ESTABLISH_TUNNEL_PAUSE_PERIOD)
+		timeout := time.After(
+			time.Duration(*controller.config.EstablishTunnelPausePeriodSeconds) * time.Second)
 		select {
 		case <-timeout:
 			// Retry iterating
@@ -987,6 +1168,7 @@ loop:
 			controller.sessionId,
 			controller.establishPendingConns,
 			candidateServerEntry.serverEntry,
+			candidateServerEntry.adjustedEstablishStartTime,
 			controller) // TunnelOwner
 		if err != nil {
 

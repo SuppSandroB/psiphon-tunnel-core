@@ -24,6 +24,7 @@ import (
 	"net"
 	"sync"
 
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/upstreamproxy"
 )
 
@@ -59,17 +60,14 @@ func makeTCPDialer(config *DialConfig) func(network, addr string) (net.Conn, err
 		}
 		conn, err := interruptibleTCPDial(addr, config)
 		if err != nil {
-			return nil, ContextError(err)
+			return nil, common.ContextError(err)
 		}
 		// Note: when an upstream proxy is used, we don't know what IP address
 		// was resolved, by the proxy, for that destination.
 		if config.ResolvedIPCallback != nil && config.UpstreamProxyUrl == "" {
-			remoteAddr := conn.RemoteAddr()
-			if remoteAddr != nil {
-				host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
-				if err == nil {
-					config.ResolvedIPCallback(host)
-				}
+			ipAddress := common.IPAddressFromAddr(conn.RemoteAddr())
+			if ipAddress != "" {
+				config.ResolvedIPCallback(ipAddress)
 			}
 		}
 		return conn, nil
@@ -94,8 +92,8 @@ func interruptibleTCPDial(addr string, config *DialConfig) (*TCPConn, error) {
 	conn := &TCPConn{dialResult: make(chan error, 1)}
 
 	// Enable interruption
-	if !config.PendingConns.Add(conn) {
-		return nil, ContextError(errors.New("pending connections already closed"))
+	if config.PendingConns != nil && !config.PendingConns.Add(conn) {
+		return nil, common.ContextError(errors.New("pending connections already closed"))
 	}
 
 	// Call the blocking Connect() in a goroutine. ConnectTimeout is handled
@@ -137,8 +135,13 @@ func interruptibleTCPDial(addr string, config *DialConfig) (*TCPConn, error) {
 	// Wait until Dial completes (or times out) or until interrupt
 	err := <-conn.dialResult
 	if err != nil {
-		return nil, ContextError(err)
+		if config.PendingConns != nil {
+			config.PendingConns.Remove(conn)
+		}
+		return nil, common.ContextError(err)
 	}
+
+	// TODO: now allow conn.dialResult to be garbage collected?
 
 	return conn, nil
 }
@@ -153,6 +156,7 @@ func proxiedTcpDial(
 		&upstreamproxy.UpstreamProxyConfig{
 			ForwardDialFunc: dialer,
 			ProxyURIString:  config.UpstreamProxyUrl,
+			CustomHeaders:   config.UpstreamProxyCustomHeaders,
 		})
 	netConn, err := upstreamDialer("tcp", addr)
 	if _, ok := err.(*upstreamproxy.Error); ok {

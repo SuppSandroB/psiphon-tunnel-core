@@ -22,6 +22,7 @@ package psiphon
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -31,13 +32,20 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
 )
 
 var noticeLoggerMutex sync.Mutex
 var noticeLogger = log.New(os.Stderr, "", 0)
 var noticeLogDiagnostics = int32(0)
 
-func setEmitDiagnosticNotices(enable bool) {
+// SetEmitDiagnosticNotices toggles whether diagnostic notices
+// are emitted. Diagnostic notices contain potentially sensitive
+// circumvention network information; only enable this in environments
+// where notices are handled securely (for example, don't include these
+// notices in log files which users could post to public forums).
+func SetEmitDiagnosticNotices(enable bool) {
 	if enable {
 		atomic.StoreInt32(&noticeLogDiagnostics, 1)
 	} else {
@@ -45,7 +53,9 @@ func setEmitDiagnosticNotices(enable bool) {
 	}
 }
 
-func getEmitDiagnoticNotices() bool {
+// GetEmitDiagnoticNotices returns the current state
+// of emitting diagnostic notices.
+func GetEmitDiagnoticNotices() bool {
 	return atomic.LoadInt32(&noticeLogDiagnostics) == 1
 }
 
@@ -73,17 +83,22 @@ func SetNoticeOutput(output io.Writer) {
 	noticeLogger = log.New(output, "", 0)
 }
 
-// outputNotice encodes a notice in JSON and writes it to the output writer.
-func outputNotice(noticeType string, isDiagnostic, showUser bool, args ...interface{}) {
+const (
+	noticeIsDiagnostic = 1
+	noticeShowUser     = 2
+)
 
-	if isDiagnostic && !getEmitDiagnoticNotices() {
+// outputNotice encodes a notice in JSON and writes it to the output writer.
+func outputNotice(noticeType string, noticeFlags uint32, args ...interface{}) {
+
+	if (noticeFlags&noticeIsDiagnostic != 0) && !GetEmitDiagnoticNotices() {
 		return
 	}
 
 	obj := make(map[string]interface{})
 	noticeData := make(map[string]interface{})
 	obj["noticeType"] = noticeType
-	obj["showUser"] = showUser
+	obj["showUser"] = (noticeFlags&noticeShowUser != 0)
 	obj["data"] = noticeData
 	obj["timestamp"] = time.Now().UTC().Format(time.RFC3339)
 	for i := 0; i < len(args)-1; i += 2 {
@@ -98,7 +113,23 @@ func outputNotice(noticeType string, isDiagnostic, showUser bool, args ...interf
 	if err == nil {
 		output = string(encodedJson)
 	} else {
-		output = fmt.Sprintf("{\"Alert\":{\"message\":\"%s\"}}", ContextError(err))
+		// Try to emit a properly formatted Alert notice that the outer client can
+		// report. One scenario where this is useful is if the preceeding Marshal
+		// fails due to bad data in the args. This has happened for a json.RawMessage
+		// field.
+		obj := make(map[string]interface{})
+		obj["noticeType"] = "Alert"
+		obj["showUser"] = false
+		obj["data"] = map[string]interface{}{
+			"message": fmt.Sprintf("Marshal notice failed: %s", common.ContextError(err)),
+		}
+		obj["timestamp"] = time.Now().UTC().Format(time.RFC3339)
+		encodedJson, err := json.Marshal(obj)
+		if err == nil {
+			output = string(encodedJson)
+		} else {
+			output = common.ContextError(errors.New("failed to marshal notice")).Error()
+		}
 	}
 	noticeLoggerMutex.Lock()
 	defer noticeLoggerMutex.Unlock()
@@ -107,22 +138,22 @@ func outputNotice(noticeType string, isDiagnostic, showUser bool, args ...interf
 
 // NoticeInfo is an informational message
 func NoticeInfo(format string, args ...interface{}) {
-	outputNotice("Info", true, false, "message", fmt.Sprintf(format, args...))
+	outputNotice("Info", noticeIsDiagnostic, "message", fmt.Sprintf(format, args...))
 }
 
 // NoticeAlert is an alert message; typically a recoverable error condition
 func NoticeAlert(format string, args ...interface{}) {
-	outputNotice("Alert", true, false, "message", fmt.Sprintf(format, args...))
+	outputNotice("Alert", noticeIsDiagnostic, "message", fmt.Sprintf(format, args...))
 }
 
 // NoticeError is an error message; typically an unrecoverable error condition
 func NoticeError(format string, args ...interface{}) {
-	outputNotice("Error", true, false, "message", fmt.Sprintf(format, args...))
+	outputNotice("Error", noticeIsDiagnostic, "message", fmt.Sprintf(format, args...))
 }
 
 // NoticeCandidateServers is how many possible servers are available for the selected region and protocol
 func NoticeCandidateServers(region, protocol string, count int) {
-	outputNotice("CandidateServers", false, false, "region", region, "protocol", protocol, "count", count)
+	outputNotice("CandidateServers", 0, "region", region, "protocol", protocol, "count", count)
 }
 
 // NoticeAvailableEgressRegions is what regions are available for egress from.
@@ -133,63 +164,104 @@ func NoticeAvailableEgressRegions(regions []string) {
 	repetitionMessage := strings.Join(sortedRegions, "")
 	outputRepetitiveNotice(
 		"AvailableEgressRegions", repetitionMessage, 0,
-		"AvailableEgressRegions", false, false, "regions", sortedRegions)
+		"AvailableEgressRegions", 0, "regions", sortedRegions)
 }
 
 // NoticeConnectingServer is details on a connection attempt
-func NoticeConnectingServer(ipAddress, region, protocol, frontingAddress string) {
-	outputNotice("ConnectingServer", true, false, "ipAddress", ipAddress, "region",
-		region, "protocol", protocol, "frontingAddress", frontingAddress)
+func NoticeConnectingServer(ipAddress, region, protocol, directTCPDialAddress string, meekConfig *MeekConfig) {
+	if meekConfig == nil {
+		outputNotice("ConnectingServer", noticeIsDiagnostic,
+			"ipAddress", ipAddress,
+			"region", region,
+			"protocol", protocol,
+			"directTCPDialAddress", directTCPDialAddress)
+	} else {
+		outputNotice("ConnectingServer", noticeIsDiagnostic,
+			"ipAddress", ipAddress,
+			"region", region,
+			"protocol", protocol,
+			"meekDialAddress", meekConfig.DialAddress,
+			"meekUseHTTPS", meekConfig.UseHTTPS,
+			"meekSNIServerName", meekConfig.SNIServerName,
+			"meekHostHeader", meekConfig.HostHeader,
+			"meekTransformedHostName", meekConfig.TransformedHostName)
+	}
 }
 
 // NoticeActiveTunnel is a successful connection that is used as an active tunnel for port forwarding
 func NoticeActiveTunnel(ipAddress, protocol string) {
-	outputNotice("ActiveTunnel", true, false, "ipAddress", ipAddress, "protocol", protocol)
+	outputNotice("ActiveTunnel", noticeIsDiagnostic, "ipAddress", ipAddress, "protocol", protocol)
 }
 
 // NoticeSocksProxyPortInUse is a failure to use the configured LocalSocksProxyPort
 func NoticeSocksProxyPortInUse(port int) {
-	outputNotice("SocksProxyPortInUse", false, true, "port", port)
+	outputNotice("SocksProxyPortInUse", noticeShowUser, "port", port)
 }
 
 // NoticeListeningSocksProxyPort is the selected port for the listening local SOCKS proxy
 func NoticeListeningSocksProxyPort(port int) {
-	outputNotice("ListeningSocksProxyPort", false, false, "port", port)
+	outputNotice("ListeningSocksProxyPort", 0, "port", port)
 }
 
 // NoticeSocksProxyPortInUse is a failure to use the configured LocalHttpProxyPort
 func NoticeHttpProxyPortInUse(port int) {
-	outputNotice("HttpProxyPortInUse", false, true, "port", port)
+	outputNotice("HttpProxyPortInUse", noticeShowUser, "port", port)
 }
 
 // NoticeListeningSocksProxyPort is the selected port for the listening local HTTP proxy
 func NoticeListeningHttpProxyPort(port int) {
-	outputNotice("ListeningHttpProxyPort", false, false, "port", port)
+	outputNotice("ListeningHttpProxyPort", 0, "port", port)
 }
 
 // NoticeClientUpgradeAvailable is an available client upgrade, as per the handshake. The
 // client should download and install an upgrade.
 func NoticeClientUpgradeAvailable(version string) {
-	outputNotice("ClientUpgradeAvailable", false, false, "version", version)
+	outputNotice("ClientUpgradeAvailable", 0, "version", version)
 }
 
-// NoticeClientUpgradeAvailable is a sponsor homepage, as per the handshake. The client
+// NoticeClientIsLatestVersion reports that an upgrade check was made and the client
+// is already the latest version. availableVersion is the version available for download,
+// if known.
+func NoticeClientIsLatestVersion(availableVersion string) {
+	outputNotice("ClientIsLatestVersion", 0, "availableVersion", availableVersion)
+}
+
+// NoticeHomepage is a sponsor homepage, as per the handshake. The client
 // should display the sponsor's homepage.
 func NoticeHomepage(url string) {
-	outputNotice("Homepage", false, false, "url", url)
+	outputNotice("Homepage", 0, "url", url)
+}
+
+// NoticeClientVerificationRequired indicates that client verification is required, as
+// indicated by the handshake. The client should submit a client verification payload.
+// Empty nonce is allowed, if ttlSeconds is 0 the client should not send verification
+// payload to the server. If resetCache is set the client must always perform a new
+// verification and update its cache
+func NoticeClientVerificationRequired(nonce string, ttlSeconds int, resetCache bool) {
+	outputNotice("ClientVerificationRequired", 0, "nonce", nonce, "ttlSeconds", ttlSeconds, "resetCache", resetCache)
 }
 
 // NoticeClientRegion is the client's region, as determined by the server and
 // reported to the client in the handshake.
 func NoticeClientRegion(region string) {
-	outputNotice("ClientRegion", true, false, "region", region)
+	outputNotice("ClientRegion", 0, "region", region)
 }
 
 // NoticeTunnels is how many active tunnels are available. The client should use this to
 // determine connecting/unexpected disconnect state transitions. When count is 0, the core is
 // disconnected; when count > 1, the core is connected.
 func NoticeTunnels(count int) {
-	outputNotice("Tunnels", false, false, "count", count)
+	outputNotice("Tunnels", 0, "count", count)
+}
+
+// NoticeSessionId is the session ID used across all tunnels established by the controller.
+func NoticeSessionId(sessionId string) {
+	outputNotice("SessionId", noticeIsDiagnostic, "sessionId", sessionId)
+}
+
+func NoticeImpairedProtocolClassification(impairedProtocolClassification map[string]int) {
+	outputNotice("ImpairedProtocolClassification", noticeIsDiagnostic,
+		"classification", impairedProtocolClassification)
 }
 
 // NoticeUntunneled indicates than an address has been classified as untunneled and is being
@@ -199,35 +271,40 @@ func NoticeTunnels(count int) {
 // users, not for diagnostics logs.
 //
 func NoticeUntunneled(address string) {
-	outputNotice("Untunneled", false, true, "address", address)
+	outputNotice("Untunneled", noticeShowUser, "address", address)
 }
 
 // NoticeSplitTunnelRegion reports that split tunnel is on for the given region.
 func NoticeSplitTunnelRegion(region string) {
-	outputNotice("SplitTunnelRegion", false, true, "region", region)
+	outputNotice("SplitTunnelRegion", noticeShowUser, "region", region)
 }
 
 // NoticeUpstreamProxyError reports an error when connecting to an upstream proxy. The
 // user may have input, for example, an incorrect address or incorrect credentials.
 func NoticeUpstreamProxyError(err error) {
-	outputNotice("UpstreamProxyError", false, true, "message", err.Error())
+	outputNotice("UpstreamProxyError", noticeShowUser, "message", err.Error())
+}
+
+// NoticeClientUpgradeDownloadedBytes reports client upgrade download progress.
+func NoticeClientUpgradeDownloadedBytes(bytes int64) {
+	outputNotice("ClientUpgradeDownloadedBytes", noticeIsDiagnostic, "bytes", bytes)
 }
 
 // NoticeClientUpgradeDownloaded indicates that a client upgrade download
 // is complete and available at the destination specified.
 func NoticeClientUpgradeDownloaded(filename string) {
-	outputNotice("ClientUpgradeDownloaded", false, false, "filename", filename)
+	outputNotice("ClientUpgradeDownloaded", 0, "filename", filename)
 }
 
 // NoticeBytesTransferred reports how many tunneled bytes have been
 // transferred since the last NoticeBytesTransferred, for the tunnel
 // to the server at ipAddress.
 func NoticeBytesTransferred(ipAddress string, sent, received int64) {
-	if getEmitDiagnoticNotices() {
-		outputNotice("BytesTransferred", true, false, "ipAddress", ipAddress, "sent", sent, "received", received)
+	if GetEmitDiagnoticNotices() {
+		outputNotice("BytesTransferred", noticeIsDiagnostic, "ipAddress", ipAddress, "sent", sent, "received", received)
 	} else {
 		// This case keeps the EmitBytesTransferred and EmitDiagnosticNotices config options independent
-		outputNotice("BytesTransferred", false, false, "sent", sent, "received", received)
+		outputNotice("BytesTransferred", 0, "sent", sent, "received", received)
 	}
 }
 
@@ -235,11 +312,11 @@ func NoticeBytesTransferred(ipAddress string, sent, received int64) {
 // transferred in total up to this point, for the tunnel to the server
 // at ipAddress.
 func NoticeTotalBytesTransferred(ipAddress string, sent, received int64) {
-	if getEmitDiagnoticNotices() {
-		outputNotice("TotalBytesTransferred", true, false, "ipAddress", ipAddress, "sent", sent, "received", received)
+	if GetEmitDiagnoticNotices() {
+		outputNotice("TotalBytesTransferred", noticeIsDiagnostic, "ipAddress", ipAddress, "sent", sent, "received", received)
 	} else {
 		// This case keeps the EmitBytesTransferred and EmitDiagnosticNotices config options independent
-		outputNotice("TotalBytesTransferred", false, false, "sent", sent, "received", received)
+		outputNotice("TotalBytesTransferred", 0, "sent", sent, "received", received)
 	}
 }
 
@@ -251,7 +328,7 @@ func NoticeLocalProxyError(proxyType string, err error) {
 	// the root error that repeats (the full error often contains
 	// different specific values, e.g., local port numbers, but
 	// the same repeating root).
-	// Assumes error format of ContextError.
+	// Assumes error format of common.ContextError.
 	repetitionMessage := err.Error()
 	index := strings.LastIndex(repetitionMessage, ": ")
 	if index != -1 {
@@ -260,27 +337,46 @@ func NoticeLocalProxyError(proxyType string, err error) {
 
 	outputRepetitiveNotice(
 		"LocalProxyError"+proxyType, repetitionMessage, 1,
-		"LocalProxyError", true, false, "message", err.Error())
+		"LocalProxyError", noticeIsDiagnostic, "message", err.Error())
 }
 
-// NoticeFrontedMeekStats reports extra network details for a
-// FRONTED-MEEK-OSSH or FRONTED-MEEK-HTTP-OSSH tunnel connection.
-func NoticeFrontedMeekStats(ipAddress string, frontedMeekStats *FrontedMeekStats) {
-	outputNotice("NoticeFrontedMeekStats", true, false, "ipAddress", ipAddress,
-		"frontingAddress", frontedMeekStats.frontingAddress,
-		"resolvedIPAddress", frontedMeekStats.resolvedIPAddress,
-		"enabledSNI", frontedMeekStats.enabledSNI,
-		"frontingHost", frontedMeekStats.frontingHost)
+// NoticeConnectedTunnelDialStats reports extra network details for tunnel connections that required extra configuration.
+func NoticeConnectedTunnelDialStats(ipAddress string, tunnelDialStats *TunnelDialStats) {
+	outputNotice("ConnectedTunnelDialStats", noticeIsDiagnostic,
+		"ipAddress", ipAddress,
+		"upstreamProxyType", tunnelDialStats.UpstreamProxyType,
+		"upstreamProxyCustomHeaderNames", strings.Join(tunnelDialStats.UpstreamProxyCustomHeaderNames, ","),
+		"meekDialAddress", tunnelDialStats.MeekDialAddress,
+		"meekDialAddress", tunnelDialStats.MeekDialAddress,
+		"meekResolvedIPAddress", tunnelDialStats.MeekResolvedIPAddress,
+		"meekSNIServerName", tunnelDialStats.MeekSNIServerName,
+		"meekHostHeader", tunnelDialStats.MeekHostHeader,
+		"meekTransformedHostName", tunnelDialStats.MeekTransformedHostName)
 }
 
 // NoticeBuildInfo reports build version info.
-func NoticeBuildInfo(buildDate, buildRepo, buildRev, goVersion, gomobileVersion string) {
-	outputNotice("NoticeBuildInfo", false, false,
-		"buildDate", buildDate,
-		"buildRepo", buildRepo,
-		"buildRev", buildRev,
-		"goVersion", goVersion,
-		"gomobileVersion", gomobileVersion)
+func NoticeBuildInfo() {
+	outputNotice("BuildInfo", 0, "buildInfo", common.GetBuildInfo())
+}
+
+// NoticeExiting indicates that tunnel-core is exiting imminently.
+func NoticeExiting() {
+	outputNotice("Exiting", 0)
+}
+
+// NoticeRemoteServerListDownloadedBytes reports remote server list download progress.
+func NoticeRemoteServerListDownloadedBytes(bytes int64) {
+	outputNotice("RemoteServerListDownloadedBytes", noticeIsDiagnostic, "bytes", bytes)
+}
+
+// NoticeRemoteServerListDownloaded indicates that a remote server list download
+// completed successfully.
+func NoticeRemoteServerListDownloaded(filename string) {
+	outputNotice("RemoteServerListDownloaded", noticeIsDiagnostic, "filename", filename)
+}
+
+func NoticeClientVerificationRequestCompleted(ipAddress string) {
+	outputNotice("NoticeClientVerificationRequestCompleted", noticeIsDiagnostic, "ipAddress", ipAddress)
 }
 
 type repetitiveNoticeState struct {
@@ -297,7 +393,7 @@ var repetitiveNoticeStates = make(map[string]*repetitiveNoticeState)
 // until the repetitionMessage differs.
 func outputRepetitiveNotice(
 	repetitionKey, repetitionMessage string, repeatLimit int,
-	noticeType string, isDiagnostic, showUser bool, args ...interface{}) {
+	noticeType string, noticeFlags uint32, args ...interface{}) {
 
 	repetitiveNoticeMutex.Lock()
 	defer repetitiveNoticeMutex.Unlock()
@@ -323,7 +419,7 @@ func outputRepetitiveNotice(
 		if state.repeats > 0 {
 			args = append(args, "repeats", state.repeats)
 		}
-		outputNotice(noticeType, isDiagnostic, showUser, args...)
+		outputNotice(noticeType, noticeFlags, args...)
 	}
 }
 

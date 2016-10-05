@@ -22,53 +22,60 @@ package psiphon
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
 	"os"
+	"strconv"
 	"time"
+
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
 )
 
 // TODO: allow all params to be configured
 
 const (
-	LEGACY_DATA_STORE_FILENAME                     = "psiphon.db"
-	DATA_STORE_FILENAME                            = "psiphon.boltdb"
-	CONNECTION_WORKER_POOL_SIZE                    = 10
-	TUNNEL_POOL_SIZE                               = 1
-	TUNNEL_CONNECT_TIMEOUT                         = 20 * time.Second
-	TUNNEL_OPERATE_SHUTDOWN_TIMEOUT                = 1 * time.Second
-	TUNNEL_PORT_FORWARD_DIAL_TIMEOUT               = 10 * time.Second
-	TUNNEL_SSH_KEEP_ALIVE_PAYLOAD_MAX_BYTES        = 256
-	TUNNEL_SSH_KEEP_ALIVE_PERIOD_MIN               = 60 * time.Second
-	TUNNEL_SSH_KEEP_ALIVE_PERIOD_MAX               = 120 * time.Second
-	TUNNEL_SSH_KEEP_ALIVE_PERIODIC_TIMEOUT         = 30 * time.Second
-	TUNNEL_SSH_KEEP_ALIVE_PERIODIC_INACTIVE_PERIOD = 10 * time.Second
-	TUNNEL_SSH_KEEP_ALIVE_PROBE_TIMEOUT            = 5 * time.Second
-	TUNNEL_SSH_KEEP_ALIVE_PROBE_INACTIVE_PERIOD    = 10 * time.Second
-	ESTABLISH_TUNNEL_TIMEOUT_SECONDS               = 300
-	ESTABLISH_TUNNEL_WORK_TIME                     = 60 * time.Second
-	ESTABLISH_TUNNEL_PAUSE_PERIOD                  = 5 * time.Second
-	ESTABLISH_TUNNEL_SERVER_AFFINITY_GRACE_PERIOD  = 1 * time.Second
-	HTTP_PROXY_ORIGIN_SERVER_TIMEOUT               = 15 * time.Second
-	HTTP_PROXY_MAX_IDLE_CONNECTIONS_PER_HOST       = 50
-	FETCH_REMOTE_SERVER_LIST_TIMEOUT               = 30 * time.Second
-	FETCH_REMOTE_SERVER_LIST_RETRY_PERIOD          = 5 * time.Second
-	FETCH_REMOTE_SERVER_LIST_STALE_PERIOD          = 6 * time.Hour
-	PSIPHON_API_CLIENT_SESSION_ID_LENGTH           = 16
-	PSIPHON_API_SERVER_TIMEOUT                     = 20 * time.Second
-	PSIPHON_API_SHUTDOWN_SERVER_TIMEOUT            = 1 * time.Second
-	PSIPHON_API_STATUS_REQUEST_PERIOD_MIN          = 5 * time.Minute
-	PSIPHON_API_STATUS_REQUEST_PERIOD_MAX          = 10 * time.Minute
-	PSIPHON_API_STATUS_REQUEST_SHORT_PERIOD_MIN    = 5 * time.Second
-	PSIPHON_API_STATUS_REQUEST_SHORT_PERIOD_MAX    = 10 * time.Second
-	PSIPHON_API_STATUS_REQUEST_PADDING_MAX_BYTES   = 256
-	PSIPHON_API_CONNECTED_REQUEST_PERIOD           = 24 * time.Hour
-	PSIPHON_API_CONNECTED_REQUEST_RETRY_PERIOD     = 5 * time.Second
-	PSIPHON_API_TUNNEL_STATS_MAX_COUNT             = 1000
-	FETCH_ROUTES_TIMEOUT                           = 1 * time.Minute
-	DOWNLOAD_UPGRADE_TIMEOUT                       = 15 * time.Minute
-	DOWNLOAD_UPGRADE_RETRY_PAUSE_PERIOD            = 5 * time.Second
-	IMPAIRED_PROTOCOL_CLASSIFICATION_DURATION      = 2 * time.Minute
-	IMPAIRED_PROTOCOL_CLASSIFICATION_THRESHOLD     = 3
-	TOTAL_BYTES_TRANSFERRED_NOTICE_PERIOD          = 5 * time.Minute
+	LEGACY_DATA_STORE_FILENAME                           = "psiphon.db"
+	DATA_STORE_FILENAME                                  = "psiphon.boltdb"
+	CONNECTION_WORKER_POOL_SIZE                          = 10
+	TUNNEL_POOL_SIZE                                     = 1
+	TUNNEL_CONNECT_TIMEOUT_SECONDS                       = 20
+	TUNNEL_OPERATE_SHUTDOWN_TIMEOUT                      = 1 * time.Second
+	TUNNEL_PORT_FORWARD_DIAL_TIMEOUT_SECONDS             = 10
+	TUNNEL_SSH_KEEP_ALIVE_PAYLOAD_MAX_BYTES              = 256
+	TUNNEL_SSH_KEEP_ALIVE_PERIOD_MIN                     = 60 * time.Second
+	TUNNEL_SSH_KEEP_ALIVE_PERIOD_MAX                     = 120 * time.Second
+	TUNNEL_SSH_KEEP_ALIVE_PERIODIC_TIMEOUT_SECONDS       = 30
+	TUNNEL_SSH_KEEP_ALIVE_PERIODIC_INACTIVE_PERIOD       = 10 * time.Second
+	TUNNEL_SSH_KEEP_ALIVE_PROBE_TIMEOUT_SECONDS          = 5
+	TUNNEL_SSH_KEEP_ALIVE_PROBE_INACTIVE_PERIOD          = 10 * time.Second
+	ESTABLISH_TUNNEL_TIMEOUT_SECONDS                     = 300
+	ESTABLISH_TUNNEL_WORK_TIME                           = 60 * time.Second
+	ESTABLISH_TUNNEL_PAUSE_PERIOD_SECONDS                = 5
+	ESTABLISH_TUNNEL_SERVER_AFFINITY_GRACE_PERIOD        = 1 * time.Second
+	HTTP_PROXY_ORIGIN_SERVER_TIMEOUT_SECONDS             = 15
+	HTTP_PROXY_MAX_IDLE_CONNECTIONS_PER_HOST             = 50
+	FETCH_REMOTE_SERVER_LIST_TIMEOUT_SECONDS             = 30
+	FETCH_REMOTE_SERVER_LIST_RETRY_PERIOD_SECONDS        = 30
+	FETCH_REMOTE_SERVER_LIST_STALE_PERIOD                = 6 * time.Hour
+	PSIPHON_API_SERVER_TIMEOUT_SECONDS                   = 20
+	PSIPHON_API_SHUTDOWN_SERVER_TIMEOUT                  = 1 * time.Second
+	PSIPHON_API_STATUS_REQUEST_PERIOD_MIN                = 5 * time.Minute
+	PSIPHON_API_STATUS_REQUEST_PERIOD_MAX                = 10 * time.Minute
+	PSIPHON_API_STATUS_REQUEST_SHORT_PERIOD_MIN          = 5 * time.Second
+	PSIPHON_API_STATUS_REQUEST_SHORT_PERIOD_MAX          = 10 * time.Second
+	PSIPHON_API_STATUS_REQUEST_PADDING_MAX_BYTES         = 256
+	PSIPHON_API_CONNECTED_REQUEST_PERIOD                 = 24 * time.Hour
+	PSIPHON_API_CONNECTED_REQUEST_RETRY_PERIOD           = 5 * time.Second
+	PSIPHON_API_TUNNEL_STATS_MAX_COUNT                   = 100
+	PSIPHON_API_CLIENT_VERIFICATION_REQUEST_RETRY_PERIOD = 5 * time.Second
+	PSIPHON_API_CLIENT_VERIFICATION_REQUEST_MAX_RETRIES  = 10
+	FETCH_ROUTES_TIMEOUT_SECONDS                         = 60
+	DOWNLOAD_UPGRADE_TIMEOUT                             = 15 * time.Minute
+	DOWNLOAD_UPGRADE_RETRY_PERIOD_SECONDS                = 30
+	DOWNLOAD_UPGRADE_STALE_PERIOD                        = 6 * time.Hour
+	IMPAIRED_PROTOCOL_CLASSIFICATION_DURATION            = 2 * time.Minute
+	IMPAIRED_PROTOCOL_CLASSIFICATION_THRESHOLD           = 3
+	TOTAL_BYTES_TRANSFERRED_NOTICE_PERIOD                = 5 * time.Minute
 )
 
 // To distinguish omitted timeout params from explicit 0 value timeout
@@ -92,11 +99,6 @@ type Config struct {
 	// continue running.
 	DataStoreDirectory string
 
-	// DataStoreTempDirectory is the directory in which to store temporary
-	// work files associated with the persistent database.
-	// This parameter is deprecated and may be removed.
-	DataStoreTempDirectory string
-
 	// PropagationChannelId is a string identifier which indicates how the
 	// Psiphon client was distributed. This parameter is required.
 	// This value is supplied by and depends on the Psiphon Network, and is
@@ -116,6 +118,14 @@ type Config struct {
 	// This value is supplied by and depends on the Psiphon Network, and is
 	// typically embedded in the client binary.
 	RemoteServerListUrl string
+
+	// RemoteServerListDownloadFilename specifies a target filename for
+	// storing the remote server list download. Data is stored in co-located
+	// files (RemoteServerListDownloadFilename.part*) to allow for resumable
+	// downloading. If not specified, the default is to use the
+	// remote object name as the filename, stored in the current working
+	// directory.
+	RemoteServerListDownloadFilename string
 
 	// RemoteServerListSignaturePublicKey specifies a public key that's
 	// used to authenticate the remote server list payload.
@@ -155,13 +165,12 @@ type Config struct {
 	TunnelProtocol string
 
 	// EstablishTunnelTimeoutSeconds specifies a time limit after which to halt
-	// the core tunnel controller if no tunnel has been established. By default,
-	// the controller will keep trying indefinitely.
+	// the core tunnel controller if no tunnel has been established. The default
+	// is ESTABLISH_TUNNEL_TIMEOUT_SECONDS.
 	EstablishTunnelTimeoutSeconds *int
 
 	// ListenInterface specifies which interface to listen on.  If no interface
 	// is provided then listen on 127.0.0.1.
-	// If an invalid interface is provided then listen on localhost (127.0.0.1).
 	// If 'any' is provided then use 0.0.0.0.
 	// If there are multiple IP addresses on an interface use the first IPv4 address.
 	ListenInterface string
@@ -192,6 +201,11 @@ type Config struct {
 	// https://github.com/Psiphon-Labs/psiphon-tunnel-core/tree/master/psiphon/upstreamproxy
 	UpstreamProxyUrl string
 
+	// UpstreamProxyCustomHeaders is a set of additional arbitrary HTTP headers that are
+	// added to all requests made through the upstream proxy specified by UpstreamProxyUrl
+	// NOTE: Only HTTP(s) proxies use this if specified
+	UpstreamProxyCustomHeaders http.Header
+
 	// NetworkConnectivityChecker is an interface that enables the core tunnel to call
 	// into the host application to check for network connectivity. This parameter is
 	// only applicable to library deployments.
@@ -208,6 +222,10 @@ type Config struct {
 	// This parameter is only applicable to library deployments.
 	DnsServerGetter DnsServerGetter
 
+	// HostNameTransformer is an interface that enables pluggable hostname
+	// transformation circumvention strategies.
+	HostNameTransformer HostNameTransformer
+
 	// TargetServerEntry is an encoded server entry. When specified, this server entry
 	// is used exclusively and all other known servers are ignored.
 	TargetServerEntry string
@@ -215,6 +233,12 @@ type Config struct {
 	// DisableApi disables Psiphon server API calls including handshake, connected,
 	// status, etc. This is used for special case temporary tunnels (Windows VPN mode).
 	DisableApi bool
+
+	// TargetApiProtocol specifies whether to force use of "ssh" or "web" API protocol.
+	// When blank, the default, the optimal API protocol is used. Note that this
+	// capability check is not applied before the "CandidateServers" count is emitted.
+	// This parameter is intended for testing and debugging only.
+	TargetApiProtocol string
 
 	// DisableRemoteServerListFetcher disables fetching remote server lists. This is
 	// used for special case temporary tunnels.
@@ -248,8 +272,17 @@ type Config struct {
 	// typically embedded in the client binary.
 	UpgradeDownloadUrl string
 
+	// UpgradeDownloadClientVersionHeader specifies the HTTP header name for the
+	// entity at UpgradeDownloadUrl which specifies the client version (an integer
+	// value). A HEAD request may be made to check the version number available at
+	// UpgradeDownloadUrl. UpgradeDownloadClientVersionHeader is required when
+	// UpgradeDownloadUrl is specified.
+	UpgradeDownloadClientVersionHeader string
+
 	// UpgradeDownloadFilename is the local target filename for an upgrade download.
 	// This parameter is required when UpgradeDownloadUrl is specified.
+	// Data is stored in co-located files (UpgradeDownloadFilename.part*) to allow
+	// for resumable downloading.
 	UpgradeDownloadFilename string
 
 	// EmitBytesTransferred indicates whether to emit periodic notices showing
@@ -293,8 +326,73 @@ type Config struct {
 	// EmitDiagnosticNotices indicates whether to output notices containing detailed
 	// information about the Psiphon session. As these notices may contain sensitive
 	// network information, they should not be insecurely distributed or displayed
-	// to users.
+	// to users. Default is off.
 	EmitDiagnosticNotices bool
+
+	// TunnelConnectTimeoutSeconds specifies a single tunnel connection sequence timeout.
+	// Zero value means that connection process will not time out.
+	// If omitted, the default value is TUNNEL_CONNECT_TIMEOUT_SECONDS.
+	TunnelConnectTimeoutSeconds *int
+
+	// TunnelPortForwardDialTimeoutSeconds specifies a dial timeout per SSH port forward.
+	// Zero value means a port forward dial will not time out.
+	// If omitted, the default value is TUNNEL_PORT_FORWARD_DIAL_TIMEOUT_SECONDS.
+	TunnelPortForwardDialTimeoutSeconds *int
+
+	// TunnelSshKeepAliveProbeTimeoutSeconds specifies a timeout value for "probe"
+	// SSH keep-alive that is sent upon port forward failure.
+	// Zero value means keep-alive request will not time out.
+	// If omitted, the default value is TUNNEL_SSH_KEEP_ALIVE_PROBE_TIMEOUT_SECONDS.
+	TunnelSshKeepAliveProbeTimeoutSeconds *int
+
+	// TunnelSshKeepAlivePeriodicTimeoutSeconds specifies a timeout value for regular
+	// SSH keep-alives that are sent periodically.
+	// Zero value means keep-alive request will not time out.
+	// If omitted, the default value is TUNNEL_SSH_KEEP_ALIVE_PERIODIC_TIMEOUT_SECONDS.
+	TunnelSshKeepAlivePeriodicTimeoutSeconds *int
+
+	// FetchRemoteServerListTimeoutSeconds specifies a timeout value for remote server list
+	// HTTP request. Zero value means that request will not time out.
+	// If omitted, the default value is FETCH_REMOTE_SERVER_LIST_TIMEOUT_SECONDS.
+	FetchRemoteServerListTimeoutSeconds *int
+
+	// PsiphonApiServerTimeoutSeconds specifies a timeout for periodic API HTTP
+	// requests to Psiphon server such as stats, home pages, etc.
+	// Zero value means that request will not time out.
+	// If omitted, the default value is PSIPHON_API_SERVER_TIMEOUT_SECONDS.
+	// Note that this value is overridden for final stats requests during shutdown
+	// process in order to prevent hangs.
+	PsiphonApiServerTimeoutSeconds *int
+
+	// FetchRoutesTimeoutSeconds specifies a timeout value for split tunnel routes
+	// HTTP request. Zero value means that request will not time out.
+	// If omitted, the default value is FETCH_ROUTES_TIMEOUT_SECONDS.
+	FetchRoutesTimeoutSeconds *int
+
+	// HttpProxyOriginServerTimeoutSeconds specifies an HTTP response header timeout
+	// value in various HTTP relays found in httpProxy.
+	// Zero value means that request will not time out.
+	// If omitted, the default value is HTTP_PROXY_ORIGIN_SERVER_TIMEOUT_SECONDS.
+	HttpProxyOriginServerTimeoutSeconds *int
+
+	// FetchRemoteServerListRetryPeriodSeconds specifies the delay before
+	// resuming a remote server list download after a failure.
+	// If omitted, the default value FETCH_REMOTE_SERVER_LIST_RETRY_PERIOD_SECONDS.
+	FetchRemoteServerListRetryPeriodSeconds *int
+
+	// DownloadUpgradestRetryPeriodSeconds specifies the delay before
+	// resuming a client upgrade download after a failure.
+	// If omitted, the default value DOWNLOAD_UPGRADE_RETRY_PERIOD_SECONDS.
+	DownloadUpgradeRetryPeriodSeconds *int
+
+	// EstablishTunnelPausePeriodSeconds specifies the delay between attempts
+	// to establish tunnels. Briefly pausing allows for network conditions to improve
+	// and for asynchronous operations such as fetch remote server list to complete.
+	// If omitted, the default value is ESTABLISH_TUNNEL_PAUSE_PERIOD_SECONDS.
+	EstablishTunnelPausePeriodSeconds *int
+
+	// RateLimits specify throttling configuration for the tunnel.
+	RateLimits common.RateLimits
 }
 
 // LoadConfig parses and validates a JSON format Psiphon config JSON
@@ -303,23 +401,28 @@ func LoadConfig(configJson []byte) (*Config, error) {
 	var config Config
 	err := json.Unmarshal(configJson, &config)
 	if err != nil {
-		return nil, ContextError(err)
+		return nil, common.ContextError(err)
+	}
+
+	// Do SetEmitDiagnosticNotices first, to ensure config file errors are emitted.
+	if config.EmitDiagnosticNotices {
+		SetEmitDiagnosticNotices(true)
 	}
 
 	// These fields are required; the rest are optional
 	if config.PropagationChannelId == "" {
-		return nil, ContextError(
+		return nil, common.ContextError(
 			errors.New("propagation channel ID is missing from the configuration file"))
 	}
 	if config.SponsorId == "" {
-		return nil, ContextError(
+		return nil, common.ContextError(
 			errors.New("sponsor ID is missing from the configuration file"))
 	}
 
 	if config.DataStoreDirectory == "" {
 		config.DataStoreDirectory, err = os.Getwd()
 		if err != nil {
-			return nil, ContextError(err)
+			return nil, common.ContextError(err)
 		}
 	}
 
@@ -327,9 +430,15 @@ func LoadConfig(configJson []byte) (*Config, error) {
 		config.ClientVersion = "0"
 	}
 
+	_, err = strconv.Atoi(config.ClientVersion)
+	if err != nil {
+		return nil, common.ContextError(
+			fmt.Errorf("invalid client version: %s", err))
+	}
+
 	if config.TunnelProtocol != "" {
-		if !Contains(SupportedTunnelProtocols, config.TunnelProtocol) {
-			return nil, ContextError(
+		if !common.Contains(common.SupportedTunnelProtocols, config.TunnelProtocol) {
+			return nil, common.ContextError(
 				errors.New("invalid tunnel protocol"))
 		}
 	}
@@ -348,19 +457,92 @@ func LoadConfig(configJson []byte) (*Config, error) {
 	}
 
 	if config.NetworkConnectivityChecker != nil {
-		return nil, ContextError(errors.New("NetworkConnectivityChecker interface must be set at runtime"))
+		return nil, common.ContextError(
+			errors.New("NetworkConnectivityChecker interface must be set at runtime"))
 	}
 
 	if config.DeviceBinder != nil {
-		return nil, ContextError(errors.New("DeviceBinder interface must be set at runtime"))
+		return nil, common.ContextError(
+			errors.New("DeviceBinder interface must be set at runtime"))
 	}
 
 	if config.DnsServerGetter != nil {
-		return nil, ContextError(errors.New("DnsServerGetter interface must be set at runtime"))
+		return nil, common.ContextError(
+			errors.New("DnsServerGetter interface must be set at runtime"))
 	}
 
-	if config.EmitDiagnosticNotices {
-		setEmitDiagnosticNotices(true)
+	if config.HostNameTransformer != nil {
+		return nil, common.ContextError(
+			errors.New("HostNameTransformer interface must be set at runtime"))
+	}
+
+	if !common.Contains(
+		[]string{"", common.PSIPHON_SSH_API_PROTOCOL, common.PSIPHON_WEB_API_PROTOCOL},
+		config.TargetApiProtocol) {
+
+		return nil, common.ContextError(
+			errors.New("invalid TargetApiProtocol"))
+	}
+
+	if config.UpgradeDownloadUrl != "" &&
+		(config.UpgradeDownloadClientVersionHeader == "" || config.UpgradeDownloadFilename == "") {
+		return nil, common.ContextError(errors.New(
+			"UpgradeDownloadUrl requires UpgradeDownloadClientVersionHeader and UpgradeDownloadFilename"))
+	}
+
+	if config.TunnelConnectTimeoutSeconds == nil {
+		defaultTunnelConnectTimeoutSeconds := TUNNEL_CONNECT_TIMEOUT_SECONDS
+		config.TunnelConnectTimeoutSeconds = &defaultTunnelConnectTimeoutSeconds
+	}
+
+	if config.TunnelPortForwardDialTimeoutSeconds == nil {
+		TunnelPortForwardDialTimeoutSeconds := TUNNEL_PORT_FORWARD_DIAL_TIMEOUT_SECONDS
+		config.TunnelPortForwardDialTimeoutSeconds = &TunnelPortForwardDialTimeoutSeconds
+	}
+
+	if config.TunnelSshKeepAliveProbeTimeoutSeconds == nil {
+		defaultTunnelSshKeepAliveProbeTimeoutSeconds := TUNNEL_SSH_KEEP_ALIVE_PROBE_TIMEOUT_SECONDS
+		config.TunnelSshKeepAliveProbeTimeoutSeconds = &defaultTunnelSshKeepAliveProbeTimeoutSeconds
+	}
+
+	if config.TunnelSshKeepAlivePeriodicTimeoutSeconds == nil {
+		defaultTunnelSshKeepAlivePeriodicTimeoutSeconds := TUNNEL_SSH_KEEP_ALIVE_PERIODIC_TIMEOUT_SECONDS
+		config.TunnelSshKeepAlivePeriodicTimeoutSeconds = &defaultTunnelSshKeepAlivePeriodicTimeoutSeconds
+	}
+
+	if config.FetchRemoteServerListTimeoutSeconds == nil {
+		defaultFetchRemoteServerListTimeoutSeconds := FETCH_REMOTE_SERVER_LIST_TIMEOUT_SECONDS
+		config.FetchRemoteServerListTimeoutSeconds = &defaultFetchRemoteServerListTimeoutSeconds
+	}
+
+	if config.PsiphonApiServerTimeoutSeconds == nil {
+		defaultPsiphonApiServerTimeoutSeconds := PSIPHON_API_SERVER_TIMEOUT_SECONDS
+		config.PsiphonApiServerTimeoutSeconds = &defaultPsiphonApiServerTimeoutSeconds
+	}
+
+	if config.FetchRoutesTimeoutSeconds == nil {
+		defaultFetchRoutesTimeoutSeconds := FETCH_ROUTES_TIMEOUT_SECONDS
+		config.FetchRoutesTimeoutSeconds = &defaultFetchRoutesTimeoutSeconds
+	}
+
+	if config.HttpProxyOriginServerTimeoutSeconds == nil {
+		defaultHttpProxyOriginServerTimeoutSeconds := HTTP_PROXY_ORIGIN_SERVER_TIMEOUT_SECONDS
+		config.HttpProxyOriginServerTimeoutSeconds = &defaultHttpProxyOriginServerTimeoutSeconds
+	}
+
+	if config.FetchRemoteServerListRetryPeriodSeconds == nil {
+		defaultFetchRemoteServerListRetryPeriodSeconds := FETCH_REMOTE_SERVER_LIST_RETRY_PERIOD_SECONDS
+		config.FetchRemoteServerListRetryPeriodSeconds = &defaultFetchRemoteServerListRetryPeriodSeconds
+	}
+
+	if config.DownloadUpgradeRetryPeriodSeconds == nil {
+		defaultDownloadUpgradeRetryPeriodSeconds := DOWNLOAD_UPGRADE_RETRY_PERIOD_SECONDS
+		config.DownloadUpgradeRetryPeriodSeconds = &defaultDownloadUpgradeRetryPeriodSeconds
+	}
+
+	if config.EstablishTunnelPausePeriodSeconds == nil {
+		defaultEstablishTunnelPausePeriodSeconds := ESTABLISH_TUNNEL_PAUSE_PERIOD_SECONDS
+		config.EstablishTunnelPausePeriodSeconds = &defaultEstablishTunnelPausePeriodSeconds
 	}
 
 	return &config, nil

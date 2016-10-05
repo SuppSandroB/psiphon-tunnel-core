@@ -28,6 +28,9 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
 )
 
 // HttpProxy is a HTTP server that relays HTTP requests through the Psiphon tunnel.
@@ -61,7 +64,7 @@ type HttpProxy struct {
 	urlProxyTunneledClient *http.Client
 	urlProxyDirectRelay    *http.Transport
 	urlProxyDirectClient   *http.Client
-	openConns              *Conns
+	openConns              *common.Conns
 	stopListeningBroadcast chan struct{}
 }
 
@@ -80,7 +83,7 @@ func NewHttpProxy(
 		if IsAddressInUseError(err) {
 			NoticeHttpProxyPortInUse(config.LocalHttpProxyPort)
 		}
-		return nil, ContextError(err)
+		return nil, common.ContextError(err)
 	}
 
 	tunneledDialer := func(_, addr string) (conn net.Conn, err error) {
@@ -94,12 +97,13 @@ func NewHttpProxy(
 		return DialTCP(addr, untunneledDialConfig)
 	}
 
+	responseHeaderTimeout := time.Duration(*config.HttpProxyOriginServerTimeoutSeconds) * time.Second
 	// TODO: could HTTP proxy share a tunneled transport with URL proxy?
 	// For now, keeping them distinct just to be conservative.
 	httpProxyTunneledRelay := &http.Transport{
 		Dial:                  tunneledDialer,
 		MaxIdleConnsPerHost:   HTTP_PROXY_MAX_IDLE_CONNECTIONS_PER_HOST,
-		ResponseHeaderTimeout: HTTP_PROXY_ORIGIN_SERVER_TIMEOUT,
+		ResponseHeaderTimeout: responseHeaderTimeout,
 	}
 
 	// Note: URL proxy relays use http.Client for upstream requests, so
@@ -109,12 +113,13 @@ func NewHttpProxy(
 	urlProxyTunneledRelay := &http.Transport{
 		Dial:                  tunneledDialer,
 		MaxIdleConnsPerHost:   HTTP_PROXY_MAX_IDLE_CONNECTIONS_PER_HOST,
-		ResponseHeaderTimeout: HTTP_PROXY_ORIGIN_SERVER_TIMEOUT,
+		ResponseHeaderTimeout: responseHeaderTimeout,
 	}
 	urlProxyTunneledClient := &http.Client{
 		Transport: urlProxyTunneledRelay,
 		Jar:       nil, // TODO: cookie support for URL proxy?
 
+		// Leaving original value in the note below:
 		// Note: don't use this timeout -- it interrupts downloads of large response bodies
 		//Timeout:   HTTP_PROXY_ORIGIN_SERVER_TIMEOUT,
 	}
@@ -122,7 +127,7 @@ func NewHttpProxy(
 	urlProxyDirectRelay := &http.Transport{
 		Dial:                  directDialer,
 		MaxIdleConnsPerHost:   HTTP_PROXY_MAX_IDLE_CONNECTIONS_PER_HOST,
-		ResponseHeaderTimeout: HTTP_PROXY_ORIGIN_SERVER_TIMEOUT,
+		ResponseHeaderTimeout: responseHeaderTimeout,
 	}
 	urlProxyDirectClient := &http.Client{
 		Transport: urlProxyDirectRelay,
@@ -138,7 +143,7 @@ func NewHttpProxy(
 		urlProxyTunneledClient: urlProxyTunneledClient,
 		urlProxyDirectRelay:    urlProxyDirectRelay,
 		urlProxyDirectClient:   urlProxyDirectClient,
-		openConns:              new(Conns),
+		openConns:              new(common.Conns),
 		stopListeningBroadcast: make(chan struct{}),
 	}
 	proxy.serveWaitGroup.Add(1)
@@ -195,14 +200,14 @@ func (proxy *HttpProxy) ServeHTTP(responseWriter http.ResponseWriter, request *h
 		hijacker, _ := responseWriter.(http.Hijacker)
 		conn, _, err := hijacker.Hijack()
 		if err != nil {
-			NoticeAlert("%s", ContextError(err))
+			NoticeAlert("%s", common.ContextError(err))
 			http.Error(responseWriter, "", http.StatusInternalServerError)
 			return
 		}
 		go func() {
 			err := proxy.httpConnectHandler(conn, request.URL.Host)
 			if err != nil {
-				NoticeAlert("%s", ContextError(err))
+				NoticeAlert("%s", common.ContextError(err))
 			}
 		}()
 	} else if request.URL.IsAbs() {
@@ -221,12 +226,12 @@ func (proxy *HttpProxy) httpConnectHandler(localConn net.Conn, target string) (e
 	// open connection for data which will never arrive.
 	remoteConn, err := proxy.tunneler.Dial(target, false, localConn)
 	if err != nil {
-		return ContextError(err)
+		return common.ContextError(err)
 	}
 	defer remoteConn.Close()
 	_, err = localConn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
 	if err != nil {
-		return ContextError(err)
+		return common.ContextError(err)
 	}
 	LocalProxyRelay(_HTTP_PROXY_TYPE, localConn, remoteConn)
 	return nil
@@ -260,7 +265,7 @@ func (proxy *HttpProxy) urlProxyHandler(responseWriter http.ResponseWriter, requ
 		err = errors.New("missing origin URL")
 	}
 	if err != nil {
-		NoticeAlert("%s", ContextError(FilterUrlError(err)))
+		NoticeAlert("%s", common.ContextError(FilterUrlError(err)))
 		forceClose(responseWriter)
 		return
 	}
@@ -268,7 +273,7 @@ func (proxy *HttpProxy) urlProxyHandler(responseWriter http.ResponseWriter, requ
 	// Origin URL must be well-formed, absolute, and have a scheme of  "http" or "https"
 	url, err := url.ParseRequestURI(originUrl)
 	if err != nil {
-		NoticeAlert("%s", ContextError(FilterUrlError(err)))
+		NoticeAlert("%s", common.ContextError(FilterUrlError(err)))
 		forceClose(responseWriter)
 		return
 	}
@@ -310,7 +315,7 @@ func relayHttpRequest(
 	}
 
 	if err != nil {
-		NoticeAlert("%s", ContextError(FilterUrlError(err)))
+		NoticeAlert("%s", common.ContextError(FilterUrlError(err)))
 		forceClose(responseWriter)
 		return
 	}
@@ -333,7 +338,7 @@ func relayHttpRequest(
 	responseWriter.WriteHeader(response.StatusCode)
 	_, err = io.Copy(responseWriter, response.Body)
 	if err != nil {
-		NoticeAlert("%s", ContextError(err))
+		NoticeAlert("%s", common.ContextError(err))
 		forceClose(responseWriter)
 		return
 	}
@@ -399,7 +404,7 @@ func (proxy *HttpProxy) serve() {
 	default:
 		if err != nil {
 			proxy.tunneler.SignalComponentFailure()
-			NoticeLocalProxyError(_HTTP_PROXY_TYPE, ContextError(err))
+			NoticeLocalProxyError(_HTTP_PROXY_TYPE, common.ContextError(err))
 		}
 	}
 	NoticeInfo("HTTP proxy stopped")
